@@ -1,0 +1,110 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ──────────────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/staff/$(request.auth.uid));
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // ── /users/{uid} ─────────────────────────────────────────
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow write: if isOwner(uid);
+
+      match /{allSubcollections=**} {
+        allow read, write: if isOwner(uid);
+      }
+    }
+
+    // ── /menu_items/{itemId} ─────────────────────────────────
+    match /menu_items/{itemId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ── /categories/{categoryId} ─────────────────────────────
+    match /categories/{categoryId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ── /coupons/{couponId} ──────────────────────────────────
+    match /coupons/{couponId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ── /offers/{offerId} ────────────────────────────────────
+    match /offers/{offerId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ── /orders/{orderId} ────────────────────────────────────
+    match /orders/{orderId} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.customer_id == request.auth.uid);
+
+      allow create: if isSignedIn()
+                    && request.resource.data.customer_id == request.auth.uid
+                    && request.resource.data.order_status == 'placed'
+                    && request.resource.data.payment_status in ['pending', 'cod_pending'];
+
+      allow update: if isAdmin()
+                    || (isSignedIn()
+                        && resource.data.customer_id == request.auth.uid
+                        && (
+                          // Cancel a still-placed order
+                          (resource.data.order_status == 'placed'
+                            && request.resource.data.order_status == 'cancelled'
+                            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['order_status', 'updated_at']))
+                          ||
+                          // FIX: order_tracking_screen.dart's _submitRating() writes
+                          // {'rating': _rating} directly from the customer's own client
+                          // once order_status == 'delivered'. Without this branch, every
+                          // rating submission hits a permission-denied error and the
+                          // "Submit Rating" button can never succeed.
+                          (resource.data.order_status == 'delivered'
+                            && request.resource.data.rating is int
+                            && request.resource.data.rating >= 1
+                            && request.resource.data.rating <= 5
+                            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['rating']))
+                        ));
+
+      allow delete: if false;
+
+      match /status_log/{logId} {
+        allow read: if isAdmin()
+                    || (isSignedIn() && get(/databases/$(database)/documents/orders/$(orderId)).data.customer_id == request.auth.uid);
+        allow write: if isAdmin();
+      }
+    }
+
+    // ── /staff/{uid} ─────────────────────────────────────────
+    match /staff/{uid} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // ── /delivery_partners/{partnerId} ───────────────────────
+    // NOTE: not referenced anywhere in either app's code yet — safe as a
+    // placeholder. If you build a rider app later, a rider authenticated
+    // as themselves (not as admin) will need to update their own doc
+    // (e.g. live location). At that point add something like:
+    //   allow update: if isSignedIn() && request.auth.uid == partnerId
+    //                 && request.resource.data.diff(resource.data)
+    //                      .affectedKeys().hasOnly(['latitude', 'longitude', 'is_online']);
+    match /delivery_partners/{partnerId} {
+      allow read, write: if isAdmin();
+    }
+  }
+}

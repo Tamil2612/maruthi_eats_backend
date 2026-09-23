@@ -1,0 +1,8 @@
+{
+  "projects": {
+    "default": "maruthi-eats",
+    "backend": "maruthi-eats"
+  },
+  "targets": {},
+  "etags": {}
+}
