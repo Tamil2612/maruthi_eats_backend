@@ -37,6 +37,7 @@ Firestore schema assumed throughout — see order_validation.py docstring.
 import hashlib
 import hmac
 import json
+import os
 from datetime import timedelta
 from decimal import Decimal
 
@@ -250,7 +251,7 @@ def place_order(req: https_fn.CallableRequest) -> dict:
             "total": total_val,
             "payment_mode": data.get("payment_mode", "cod"),
             "payment_status": "pending" if data.get("payment_mode") == "upi" else "cod_pending",
-            "order_status": "placed",
+            "order_status": "pending_payment" if data.get("payment_mode") == "upi" else "placed",
             "delivery_address": data.get("delivery_address"),
             "address_label": data.get("address_label"),
             "latitude": data.get("latitude"),
@@ -361,92 +362,107 @@ def expire_promotions(event: scheduler_fn.ScheduledEvent) -> None:
 # =======================================================================
 # 5. Payment — Razorpay order creation + webhook
 # =======================================================================
-# @https_fn.on_call(
-#     region=REGION,
-#     secrets=[RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET],
-# )
-# def razorpay_create_order(req: https_fn.CallableRequest) -> dict:
-#     if req.auth is None:
-#         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
+@https_fn.on_call(region=REGION)
+def razorpay_create_order(req: https_fn.CallableRequest) -> dict:
+    if req.auth is None:
+        raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
 
-#     order_id = req.data.get("order_id")
-#     if not order_id:
-#         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.INVALID_ARGUMENT, "order_id is required")
+    try:
+        order_id = (req.data or {}).get("order_id")
+        if not order_id:
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.INVALID_ARGUMENT, "order_id is required")
 
-#     db = firestore.client()
-#     order_doc = db.collection("orders").document(order_id).get()
-#     if not order_doc.exists:
-#         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.NOT_FOUND, "Order not found")
+        db = firestore.client()
+        order_doc = db.collection("orders").document(order_id).get()
+        if not order_doc.exists:
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.NOT_FOUND, "Order not found")
 
-#     order = order_doc.to_dict()
-#     if order.get("customer_id") != req.auth.uid:
-#         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.PERMISSION_DENIED, "Not your order")
+        order = order_doc.to_dict() or {}
+        if order.get("customer_id") != req.auth.uid:
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.PERMISSION_DENIED, "Not your order")
 
-#     # Convert Decimal total to paise (smallest currency unit) for Razorpay
-#     amount_paise = int((Decimal(str(order["total"])) * 100).quantize(Decimal('1')))
+        # Convert total to paise (smallest currency unit in INR, e.g. 100 INR = 10000 paise)
+        total_float = parse_float(order.get("total", 0))
+        amount_paise = int(round(total_float * 100))
 
-#     client = razorpay.Client(auth=(RAZORPAY_KEY_ID.value, RAZORPAY_KEY_SECRET.value))
-#     razorpay_order = client.order.create({
-#         "amount": amount_paise,
-#         "currency": "INR",
-#         "receipt": order_id,
-#         "notes": {"firestore_order_id": order_id},
-#     })
+        key_id = os.environ.get("RAZORPAY_KEY_ID", "rzp_test_YOUR_KEY_ID")
+        key_secret = os.environ.get("RAZORPAY_KEY_SECRET", "YOUR_KEY_SECRET")
 
-#     db.collection("orders").document(order_id).update({"razorpay_order_id": razorpay_order["id"]})
+        client = razorpay.Client(auth=(key_id, key_secret))
+        razorpay_order = client.order.create({
+            "amount": amount_paise,
+            "currency": "INR",
+            "receipt": order_id,
+            "notes": {"firestore_order_id": order_id},
+        })
 
-#     return {
-#         "razorpay_order_id": razorpay_order["id"],
-#         "amount": amount_paise,
-#         "currency": "INR",
-#         "key_id": RAZORPAY_KEY_ID.value,
-#     }
+        db.collection("orders").document(order_id).update({
+            "razorpay_order_id": razorpay_order["id"],
+        })
+
+        return {
+            "razorpay_order_id": razorpay_order["id"],
+            "amount": amount_paise,
+            "currency": "INR",
+            "key_id": key_id,
+        }
+    except https_fn.HttpsError:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.INTERNAL,
+            f"Error creating Razorpay order: {type(e).__name__} - {str(e)}",
+        )
 
 
-# @https_fn.on_request(region=REGION, secrets=[RAZORPAY_WEBHOOK_SECRET])
-# def razorpay_webhook(req: https_fn.Request) -> https_fn.Response:
-#     signature = req.headers.get("X-Razorpay-Signature", "")
-#     body = req.get_data()
+@https_fn.on_request(region=REGION)
+def razorpay_webhook(req: https_fn.Request) -> https_fn.Response:
+    signature = req.headers.get("X-Razorpay-Signature", "")
+    body = req.get_data()
 
-#     expected_signature = hmac.new(
-#         RAZORPAY_WEBHOOK_SECRET.value.encode(), body, hashlib.sha256
-#     ).hexdigest()
+    webhook_secret = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
+    if webhook_secret:
+        expected_signature = hmac.new(
+            webhook_secret.encode(), body, hashlib.sha256
+        ).hexdigest()
 
-#     if not hmac.compare_digest(expected_signature, signature):
-#         return https_fn.Response("Invalid signature", status=400)
+        if not hmac.compare_digest(expected_signature, signature):
+            return https_fn.Response("Invalid signature", status=400)
 
-#     try:
-#         payload = json.loads(body)
-#     except json.JSONDecodeError:
-#         return https_fn.Response("Invalid JSON", status=400)
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return https_fn.Response("Invalid JSON", status=400)
 
-#     event_type = payload.get("event")
+    event_type = payload.get("event")
 
-#     if event_type == "payment.captured":
-#         try:
-#             payment_entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
-#             firestore_order_id = payment_entity.get("notes", {}).get("firestore_order_id")
-#             if firestore_order_id:
-#                 db = firestore.client()
-#                 db.collection("orders").document(firestore_order_id).update({
-#                     "payment_status": "paid",
-#                     "razorpay_payment_id": payment_entity.get("id"),
-#                 })
-#         except (KeyError, TypeError):
-#             # Malformed payload - log but don't crash
-#             pass
+    if event_type == "payment.captured":
+        try:
+            payment_entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
+            firestore_order_id = payment_entity.get("notes", {}).get("firestore_order_id")
+            if firestore_order_id:
+                db = firestore.client()
+                db.collection("orders").document(firestore_order_id).update({
+                    "payment_status": "paid",
+                    "razorpay_payment_id": payment_entity.get("id"),
+                })
+        except Exception as e:
+            print(f"Error handling payment.captured: {e}")
 
-#     elif event_type == "payment.failed":
-#         try:
-#             payment_entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
-#             firestore_order_id = payment_entity.get("notes", {}).get("firestore_order_id")
-#             if firestore_order_id:
-#                 db = firestore.client()
-#                 db.collection("orders").document(firestore_order_id).update({
-#                     "payment_status": "failed",
-#                 })
-#         except (KeyError, TypeError):
-#             # Malformed payload - log but don't crash
-#             pass
+    elif event_type == "payment.failed":
+        try:
+            payment_entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
+            firestore_order_id = payment_entity.get("notes", {}).get("firestore_order_id")
+            if firestore_order_id:
+                db = firestore.client()
+                db.collection("orders").document(firestore_order_id).update({
+                    "payment_status": "failed",
+                })
+        except Exception as e:
+            print(f"Error handling payment.failed: {e}")
+
+    return https_fn.Response("OK", status=200)
 
 #     return https_fn.Response("OK", status=200)
