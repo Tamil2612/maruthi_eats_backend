@@ -15,6 +15,7 @@ Firestore schema this assumes (matches the existing app exactly):
 """
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from google.cloud.firestore import Client as FirestoreClient
 
 # Flat delivery fee — matches CartProvider.deliveryFee in the Flutter app
@@ -24,58 +25,90 @@ from google.cloud.firestore import Client as FirestoreClient
 DELIVERY_FEE = 30.0
 
 
-def effective_price(menu_item: dict) -> float:
+def parse_int(val, default=1) -> int:
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    if isinstance(val, str):
+        try:
+            return int(float(val))
+        except ValueError:
+            return default
+    if isinstance(val, dict):
+        for k in ("qty", "quantity", "value", "val", "count", "number"):
+            if k in val:
+                return parse_int(val[k], default)
+        for v in val.values():
+            if isinstance(v, (int, float, str)):
+                return parse_int(v, default)
+    return default
+
+
+def parse_float(val, default=0.0) -> float:
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        try:
+            return float(val)
+        except ValueError:
+            return default
+    if isinstance(val, dict):
+        for k in ("price", "amount", "value", "val"):
+            if k in val:
+                return parse_float(val[k], default)
+        for v in val.values():
+            if isinstance(v, (int, float, str)):
+                return parse_float(v, default)
+    return default
+
+
+def effective_price(menu_item: dict) -> Decimal:
     """The real, current price of a menu item, honoring an active discount."""
     if menu_item.get("has_discount"):
-        return float(menu_item.get("discount_price") or 0)
-    return float(menu_item.get("price") or 0)
+        return Decimal(str(parse_float(menu_item.get("discount_price"))))
+    return Decimal(str(parse_float(menu_item.get("price"))))
 
 
-def price_items(db: FirestoreClient, items: list[dict]) -> tuple[float, list[str]]:
-    """
-    Given a list of order line items (the same shape CartItem.toOrderMap()
-    produces: item_id, name, price, qty, is_offer, is_free, ...), look up
-    each item's REAL current price from Firestore and recompute the total.
-
-    Returns (recomputed_item_total, list_of_problems). An empty problems
-    list means everything checked out. Items marked `is_free` are expected
-    to be priced at 0 (BOGO/offer freebies) — anything else is flagged.
-    Items marked `is_offer` but not free are trusted at their submitted
-    price for now, since combo/bundle pricing is set by the admin per-offer
-    rather than derived from individual item prices; flag this as a known
-    gap if you want tighter validation on combo pricing specifically.
-    """
+def price_items(db: FirestoreClient, items: list[dict]) -> tuple[Decimal, list[str]]:
     problems: list[str] = []
-    recomputed_total = 0.0
+    recomputed_total = Decimal('0')
 
     for line in items:
+        if not isinstance(line, dict):
+            continue
         item_id = line.get("item_id")
-        qty = int(line.get("qty") or 0)
-        submitted_price = float(line.get("price") or 0)
+        if isinstance(item_id, dict):
+            item_id = item_id.get("id") or item_id.get("item_id") or str(item_id)
+
+        qty = parse_int(line.get("qty"))
+        submitted_price = Decimal(str(parse_float(line.get("price"))))
         is_free = bool(line.get("is_free"))
         is_offer = bool(line.get("is_offer"))
 
         if is_free:
-            if submitted_price != 0:
+            if submitted_price != Decimal('0'):
                 problems.append(f"Item {item_id} marked free but priced at {submitted_price}")
             continue  # free items don't contribute to the total
 
         if is_offer:
-            # Trusted as-is — see docstring. Still counts toward the total.
             recomputed_total += submitted_price * qty
             continue
 
-        menu_doc = db.collection("menu_items").document(item_id).get()
+        if not item_id:
+            continue
+
+        menu_doc = db.collection("menu_items").document(str(item_id)).get()
         if not menu_doc.exists:
             problems.append(f"Item {item_id} no longer exists in the menu")
             continue
 
-        menu_item = menu_doc.to_dict()
+        menu_item = menu_doc.to_dict() or {}
         if not menu_item.get("available", True):
             problems.append(f"Item {item_id} ({menu_item.get('name')}) is not currently available")
 
         real_price = effective_price(menu_item)
-        if abs(real_price - submitted_price) > 0.01:
+        if abs(real_price - submitted_price) > Decimal('0.01'):
             problems.append(
                 f"Item {item_id} ({menu_item.get('name')}) priced at {submitted_price}, "
                 f"but current price is {real_price}"
@@ -83,10 +116,10 @@ def price_items(db: FirestoreClient, items: list[dict]) -> tuple[float, list[str
 
         recomputed_total += real_price * qty
 
-    return round(recomputed_total, 2), problems
+    return recomputed_total.quantize(Decimal('0.01')), problems
 
 
-def validate_coupon(db: FirestoreClient, coupon_code: str | None, item_total: float) -> tuple[float, str | None]:
+def validate_coupon(db: FirestoreClient, coupon_code: str | None, item_total: float | Decimal) -> tuple[Decimal, str | None]:
     """
     Re-checks a coupon the same way the Flutter admin/customer apps do
     (lib/screens/coupons_screen.dart, lib/providers/cart_provider.dart):
@@ -97,25 +130,33 @@ def validate_coupon(db: FirestoreClient, coupon_code: str | None, item_total: fl
     coupon is valid (or none was applied); discount_amount is 0 if invalid.
     """
     if not coupon_code:
-        return 0.0, None
+        return Decimal('0'), None
 
     matches = db.collection("coupons").where("code", "==", coupon_code).limit(1).get()
     if not matches:
-        return 0.0, f"Coupon '{coupon_code}' does not exist"
+        return Decimal('0'), f"Coupon '{coupon_code}' does not exist"
 
-    coupon = matches[0].to_dict()
+    coupon = matches[0].to_dict() or {}
 
     if not coupon.get("is_active", True):
-        return 0.0, f"Coupon '{coupon_code}' is not active"
+        return Decimal('0'), f"Coupon '{coupon_code}' is not active"
 
     expiry = coupon.get("expiry_date")
     if expiry is not None:
-        # Firestore Timestamps come back as timezone-aware datetimes already.
-        if expiry < datetime.now(timezone.utc):
-            return 0.0, f"Coupon '{coupon_code}' has expired"
+        if isinstance(expiry, str):
+            try:
+                expiry = datetime.fromisoformat(expiry)
+            except ValueError:
+                expiry = None
+        if isinstance(expiry, datetime):
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if expiry < datetime.now(timezone.utc):
+                return Decimal('0'), f"Coupon '{coupon_code}' has expired"
 
-    min_order = float(coupon.get("min_order_value") or 0)
-    if item_total < min_order:
-        return 0.0, f"Coupon '{coupon_code}' requires a minimum order of {min_order}, cart is {item_total}"
+    min_order = Decimal(str(coupon.get("min_order_value") or 0))
+    item_total_decimal = Decimal(str(item_total))
+    if item_total_decimal < min_order:
+        return Decimal('0'), f"Coupon '{coupon_code}' requires a minimum order of {min_order}, cart is {item_total_decimal}"
 
-    return float(coupon.get("amount") or 0), None
+    return Decimal(str(coupon.get("amount") or 0)), None
