@@ -25,10 +25,16 @@ from google.cloud.firestore import Client as FirestoreClient
 DELIVERY_FEE = 30.0
 
 
+MAX_QTY_PER_ITEM = 50
+MAX_LINES_PER_ORDER = 40
+
+
 def parse_int(val, default=1) -> int:
+    if isinstance(val, bool):
+        return default
     if isinstance(val, int):
         return val
-    if isinstance(val, float):
+    if isinstance(val, (float, Decimal)):
         return int(val)
     if isinstance(val, str):
         try:
@@ -46,7 +52,9 @@ def parse_int(val, default=1) -> int:
 
 
 def parse_float(val, default=0.0) -> float:
-    if isinstance(val, (int, float)):
+    if isinstance(val, bool):
+        return default
+    if isinstance(val, (int, float, Decimal)):
         return float(val)
     if isinstance(val, str):
         try:
@@ -70,6 +78,41 @@ def effective_price(menu_item: dict) -> Decimal:
     return Decimal(str(parse_float(menu_item.get("price"))))
 
 
+def is_doc_expired(expiry) -> bool:
+    """Checks whether an expiry_date (Timestamp, datetime, or ISO str) has passed."""
+    if expiry is None:
+        return False
+    if isinstance(expiry, str):
+        try:
+            expiry = datetime.fromisoformat(expiry)
+        except ValueError:
+            return False
+    if isinstance(expiry, datetime):
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        return expiry < datetime.now(timezone.utc)
+    return False
+
+
+def validate_offer(db: FirestoreClient, offer_id: str) -> tuple[dict | None, str | None]:
+    """Look up an offer document by ID and verify it is active and unexpired."""
+    if not offer_id:
+        return None, "Offer ID is missing"
+
+    offer_doc = db.collection("offers").document(offer_id).get()
+    if not offer_doc.exists:
+        return None, f"Offer '{offer_id}' no longer exists"
+
+    offer = offer_doc.to_dict() or {}
+    if not offer.get("is_active", True):
+        return None, f"Offer '{offer.get('title', offer_id)}' is no longer active"
+
+    if is_doc_expired(offer.get("expiry_date")):
+        return None, f"Offer '{offer.get('title', offer_id)}' has expired"
+
+    return offer, None
+
+
 def price_items(db: FirestoreClient, items: list[dict]) -> tuple[Decimal, list[str]]:
     problems: list[str] = []
     recomputed_total = Decimal('0')
@@ -82,6 +125,9 @@ def price_items(db: FirestoreClient, items: list[dict]) -> tuple[Decimal, list[s
             item_id = item_id.get("id") or item_id.get("item_id") or str(item_id)
 
         qty = parse_int(line.get("qty"))
+        if qty < 1 or qty > MAX_QTY_PER_ITEM:
+            problems.append(f"Invalid quantity {qty} for item {item_id}. Must be between 1 and {MAX_QTY_PER_ITEM}.")
+
         submitted_price = Decimal(str(parse_float(line.get("price"))))
         is_free = bool(line.get("is_free"))
         is_offer = bool(line.get("is_offer"))
@@ -92,6 +138,17 @@ def price_items(db: FirestoreClient, items: list[dict]) -> tuple[Decimal, list[s
             continue  # free items don't contribute to the total
 
         if is_offer:
+            offer_id = str(line.get("offer_id") or "")
+            if offer_id:
+                offer, offer_err = validate_offer(db, offer_id)
+                if offer_err:
+                    problems.append(offer_err)
+                elif offer and offer.get("type") == "combo":
+                    expected_price = Decimal(str(parse_float(offer.get("combo_price", 0))))
+                    if abs(expected_price - submitted_price) > Decimal('0.01'):
+                        problems.append(
+                            f"Combo offer '{offer.get('title')}' submitted price {submitted_price} does not match expected {expected_price}"
+                        )
             recomputed_total += submitted_price * qty
             continue
 
@@ -121,13 +178,9 @@ def price_items(db: FirestoreClient, items: list[dict]) -> tuple[Decimal, list[s
 
 def validate_coupon(db: FirestoreClient, coupon_code: str | None, item_total: float | Decimal) -> tuple[Decimal, str | None]:
     """
-    Re-checks a coupon the same way the Flutter admin/customer apps do
-    (lib/screens/coupons_screen.dart, lib/providers/cart_provider.dart):
+    Re-checks a coupon the same way the Flutter admin/customer apps do:
     must exist, be active, not expired, and item_total must meet its
     minimum order value.
-
-    Returns (discount_amount, error_message). error_message is None if the
-    coupon is valid (or none was applied); discount_amount is 0 if invalid.
     """
     if not coupon_code:
         return Decimal('0'), None
@@ -141,22 +194,12 @@ def validate_coupon(db: FirestoreClient, coupon_code: str | None, item_total: fl
     if not coupon.get("is_active", True):
         return Decimal('0'), f"Coupon '{coupon_code}' is not active"
 
-    expiry = coupon.get("expiry_date")
-    if expiry is not None:
-        if isinstance(expiry, str):
-            try:
-                expiry = datetime.fromisoformat(expiry)
-            except ValueError:
-                expiry = None
-        if isinstance(expiry, datetime):
-            if expiry.tzinfo is None:
-                expiry = expiry.replace(tzinfo=timezone.utc)
-            if expiry < datetime.now(timezone.utc):
-                return Decimal('0'), f"Coupon '{coupon_code}' has expired"
+    if is_doc_expired(coupon.get("expiry_date")):
+        return Decimal('0'), f"Coupon '{coupon_code}' has expired"
 
     min_order = Decimal(str(coupon.get("min_order_value") or 0))
     item_total_decimal = Decimal(str(item_total))
     if item_total_decimal < min_order:
-        return Decimal('0'), f"Coupon '{coupon_code}' requires a minimum order of {min_order}, cart is {item_total_decimal}"
+        return Decimal('0'), f"Coupon '{coupon_code}' requires a minimum order of ₹{min_order}, cart total is ₹{item_total_decimal}"
 
     return Decimal(str(coupon.get("amount") or 0)), None

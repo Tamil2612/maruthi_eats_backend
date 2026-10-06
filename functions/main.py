@@ -33,6 +33,11 @@ app review:
                          alert) and only becomes `placed` once the payment is
                          verified on the server (signature check from the app,
                          webhook as backup). Unpaid orders expire after 30 min.
+6. on_order_refund_needed / fail_stuck_refunds — Razorpay refunds. A paid UPI
+                         order that is cancelled (or that was paid after it
+                         expired) is refunded automatically, in full, from the
+                         server. refund.processed / refund.failed webhooks
+                         keep `refund_status` up to date.
 
 Firestore schema assumed throughout — see order_validation.py docstring.
 """
@@ -47,6 +52,26 @@ from decimal import Decimal
 from firebase_admin import initialize_app, firestore, messaging
 from firebase_functions import firestore_fn, https_fn, scheduler_fn, options, params
 import razorpay
+
+from order_validation import (
+    DELIVERY_FEE,
+    MAX_LINES_PER_ORDER,
+    MAX_QTY_PER_ITEM,
+    effective_price,
+    price_items,
+    validate_coupon,
+    validate_offer,
+    parse_int,
+    parse_float,
+)
+from restaurant_settings import (
+    load_restaurant_settings,
+    check_restaurant_availability,
+    calculate_distance_km,
+    validate_delivery_distance,
+    calculate_delivery_fee,
+    validate_minimum_order,
+)
 
 from order_validation import DELIVERY_FEE, price_items, validate_coupon, parse_int, parse_float
 
@@ -188,7 +213,7 @@ def on_order_created(event: firestore_fn.Event) -> None:
 # =======================================================================
 # 2. Secure order placement (optional — replaces the client's direct write)
 # =======================================================================
-@https_fn.on_call(region=REGION)
+@https_fn.on_call(region=REGION, enforce_app_check=True)
 def place_order(req: https_fn.CallableRequest) -> dict:
     if req.auth is None:
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
@@ -196,29 +221,227 @@ def place_order(req: https_fn.CallableRequest) -> dict:
     try:
         db = firestore.client()
         data = req.data or {}
-        items = data.get("items", [])  # [{item_id, name, qty, is_offer, is_free, ...}]
+        items = data.get("items", [])
         coupon_code = data.get("coupon_code")
+        if coupon_code is not None:
+            if not isinstance(coupon_code, str):
+                raise https_fn.HttpsError(https_fn.FunctionsErrorCode.INVALID_ARGUMENT, "Invalid coupon code")
+            coupon_code = coupon_code.strip()[:40] or None
 
-        if not items:
+        if not isinstance(items, list) or not items:
             raise https_fn.HttpsError(https_fn.FunctionsErrorCode.INVALID_ARGUMENT, "Cart is empty")
+        if len(items) > MAX_LINES_PER_ORDER:
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+                f"An order can have at most {MAX_LINES_PER_ORDER} different items",
+            )
+
+        # 0. Anti-abuse rate limiting & active orders cap
+        now_utc = datetime.now(timezone.utc)
+
+        # Check active orders count (max 3 active/pending orders per customer to prevent COD spamming)
+        active_orders = (
+            db.collection("orders")
+            .where("customer_id", "==", req.auth.uid)
+            .where("order_status", "in", ["placed", "confirmed", "preparing", "out_for_delivery", "pending_payment"])
+            .get()
+        )
+        if len(active_orders) >= 3:
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                "You have 3 or more active orders. Please wait for your current orders to be delivered before placing a new one.",
+            )
+
+        # Check order frequency cooldown (at least 60 seconds between consecutive orders)
+        recent_orders = (
+            db.collection("orders")
+            .where("customer_id", "==", req.auth.uid)
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(1)
+            .get()
+        )
+        if recent_orders:
+            last_order = recent_orders[0].to_dict() or {}
+            created_at = last_order.get("created_at")
+            if isinstance(created_at, datetime):
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                if (now_utc - created_at).total_seconds() < 60:
+                    raise https_fn.HttpsError(
+                        https_fn.FunctionsErrorCode.RESOURCE_EXHAUSTED,
+                        "Please wait at least 60 seconds before placing another order.",
+                    )
+
+        # 1. Validate payment_mode strictly
+        payment_mode = str(data.get("payment_mode") or "cod").lower().strip()
+        if payment_mode not in ("upi", "cod"):
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+                "payment_mode must be 'upi' or 'cod'",
+            )
+
+        # 2. Validate & sanitize delivery_address
+        delivery_address = str(data.get("delivery_address") or "").strip()
+        if not delivery_address:
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+                "Delivery address is required",
+            )
+        if len(delivery_address) > 500:
+            delivery_address = delivery_address[:500]
+
+        address_label = str(data.get("address_label") or "Home").strip()[:50]
+
+        # 3. Validate coordinates if provided
+        lat = parse_float(data["latitude"]) if "latitude" in data and data["latitude"] is not None else None
+        lng = parse_float(data["longitude"]) if "longitude" in data and data["longitude"] is not None else None
+        if lat is None or lng is None or (lat == 0.0 and lng == 0.0) or not (-90.0 <= lat <= 90.0) or not (-180.0 <= lng <= 180.0):
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+                "Valid delivery coordinates (latitude and longitude) are required.",
+            )
+
+        # 4. Load restaurant settings and check availability
+        settings = load_restaurant_settings(db)
+        is_avail, status_code, avail_msg = check_restaurant_availability(settings, now_utc)
+        if not is_avail:
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                avail_msg,
+            )
+
+        # 5. Calculate delivery distance and validate delivery radius
+        delivery_settings = settings.get("delivery") or {}
+        rest_lat = parse_float(delivery_settings.get("restaurant_latitude"), default=0.0)
+        rest_lng = parse_float(delivery_settings.get("restaurant_longitude"), default=0.0)
+
+        if rest_lat == 0.0 and rest_lng == 0.0:
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                "Restaurant location is not configured on the server.",
+            )
+
+        distance_km = calculate_distance_km(rest_lat, rest_lng, lat, lng)
+        dist_valid, dist_msg = validate_delivery_distance(delivery_settings, distance_km)
+        if not dist_valid:
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                dist_msg,
+            )
 
         priced_items = []
         item_total = Decimal('0')
+        # BOGO bookkeeping: free units must be earned by paid units of the same offer
+        bogo_offers: dict = {}
+        bogo_paid_units: dict = {}
+        bogo_free_units: dict = {}
+
         for line in items:
             if not isinstance(line, dict):
                 continue
 
-            qty = parse_int(line.get("qty"))
-            price = parse_float(line.get("price"))
+            # Enforce quantity limits on EVERY line (1 to MAX_QTY_PER_ITEM)
+            qty = parse_int(line.get("qty"), default=0)
+            if qty < 1 or qty > MAX_QTY_PER_ITEM:
+                raise https_fn.HttpsError(
+                    https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+                    f"Quantity for each item must be between 1 and {MAX_QTY_PER_ITEM}. Received: {qty}",
+                )
 
-            if line.get("is_free"):
-                priced_items.append({**line, "price": 0, "qty": qty})
-                continue
-            if line.get("is_offer"):
-                priced_items.append({**line, "price": price, "qty": qty})
-                item_total += Decimal(str(price)) * qty
-                continue
+            is_offer = bool(line.get("is_offer"))
+            is_free = bool(line.get("is_free"))
+            offer_id = str(line.get("offer_id") or "")
+            parent_offer_id = str(line.get("parent_offer_id") or "")
 
+            # --- CASE A: Offer lines or Free items ---
+            if is_offer or is_free or offer_id or parent_offer_id:
+                target_offer_id = offer_id or parent_offer_id
+                if not target_offer_id:
+                    raise https_fn.HttpsError(
+                        https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                        "Offer line missing offer_id",
+                    )
+
+                offer, offer_err = validate_offer(db, target_offer_id)
+                if offer_err:
+                    raise https_fn.HttpsError(
+                        https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                        offer_err,
+                    )
+
+                offer_type = offer.get("type", "combo")
+
+                if is_free:
+                    # Free item MUST be part of a valid active BOGO offer
+                    if offer_type != "bogo":
+                        raise https_fn.HttpsError(
+                            https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                            "Item marked free is not part of a BOGO offer",
+                        )
+                    bogo_offers[target_offer_id] = offer
+                    bogo_free_units[target_offer_id] = bogo_free_units.get(target_offer_id, 0) + qty
+                    priced_items.append({
+                        "item_id": str(offer.get("get_item_id") or line.get("item_id") or f"{target_offer_id}_get"),
+                        "name": str(offer.get("get_item_name") or "Free Item"),
+                        "price": 0.0,
+                        "qty": qty,
+                        "is_offer": True,
+                        "is_free": True,
+                        "offer_id": target_offer_id,
+                        "offer_description": f"FREE with {offer.get('title') or 'offer'}",
+                    })
+                    continue
+
+                if offer_type == "combo":
+                    # Server authoritative price for combo offer
+                    combo_price = parse_float(offer.get("combo_price", 0))
+                    item_total += Decimal(str(combo_price)) * qty
+                    priced_items.append({
+                        "item_id": f"offer_{target_offer_id}",
+                        "name": str(offer.get("title") or "Combo Offer"),
+                        "price": combo_price,
+                        "qty": qty,
+                        "is_offer": True,
+                        "is_free": False,
+                        "offer_id": target_offer_id,
+                        "offer_description": str(offer.get("description") or ""),
+                        "is_combo": True,
+                        "bundle_items": offer.get("bundle_items") or [],
+                    })
+                    continue
+
+                if offer_type == "bogo":
+                    buy_item_id = str(offer.get("buy_item_id") or "")
+                    menu_doc = db.collection("menu_items").document(buy_item_id).get() if buy_item_id else None
+                    if not menu_doc or not menu_doc.exists:
+                        raise https_fn.HttpsError(
+                            https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                            f"The offer '{offer.get('title', target_offer_id)}' is no longer available",
+                        )
+                    menu_item = menu_doc.to_dict() or {}
+                    if not menu_item.get("available", True):
+                        raise https_fn.HttpsError(
+                            https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                            f"{menu_item.get('name', 'Item')} is currently unavailable",
+                        )
+                    real_price = float(effective_price(menu_item))
+
+                    bogo_offers[target_offer_id] = offer
+                    bogo_paid_units[target_offer_id] = bogo_paid_units.get(target_offer_id, 0) + qty
+                    item_total += Decimal(str(real_price)) * qty
+                    priced_items.append({
+                        "item_id": buy_item_id,
+                        "name": str(offer.get("buy_item_name") or menu_item.get("name") or "Item"),
+                        "price": real_price,
+                        "qty": qty,
+                        "is_offer": True,
+                        "is_free": False,
+                        "offer_id": target_offer_id,
+                        "offer_description": f"Part of: {offer.get('title') or 'offer'}",
+                    })
+                    continue
+
+            # --- CASE B: Regular Menu Items ---
             item_id = line.get("item_id")
             if isinstance(item_id, dict):
                 item_id = item_id.get("id") or item_id.get("item_id") or str(item_id)
@@ -241,42 +464,78 @@ def place_order(req: https_fn.CallableRequest) -> dict:
                     https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
                     f"{menu_item.get('name', 'Item')} is currently unavailable",
                 )
-            real_price = parse_float(menu_item.get("discount_price") if menu_item.get("has_discount") else menu_item.get("price"))
+
+            real_price = float(effective_price(menu_item))
             item_total += Decimal(str(real_price)) * qty
-            priced_items.append({**line, "name": menu_item.get("name", ""), "price": real_price, "qty": qty})
+            priced_items.append({
+                "item_id": str(item_id),
+                "name": str(menu_item.get("name", "")),
+                "price": real_price,
+                "qty": qty,
+                "is_offer": False,
+                "is_free": False,
+            })
+
+        # Free units must be earned: floor(paid / buy_qty) * get_qty per BOGO offer.
+        for offer_key, free_units in bogo_free_units.items():
+            offer = bogo_offers[offer_key]
+            buy_qty = max(1, parse_int(offer.get("buy_qty"), default=1))
+            get_qty = max(1, parse_int(offer.get("get_qty"), default=1))
+            earned = (bogo_paid_units.get(offer_key, 0) // buy_qty) * get_qty
+            if free_units > earned:
+                raise https_fn.HttpsError(
+                    https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                    f"Free items in '{offer.get('title', offer_key)}' do not match the items bought",
+                )
 
         item_total_dec = item_total.quantize(Decimal('0.01'))
+        food_subtotal = float(item_total_dec)
+
+        # 6. Validate Minimum Order Value against Food Subtotal (before coupon, excluding delivery)
+        min_valid, min_msg = validate_minimum_order(settings, food_subtotal)
+        if not min_valid:
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                min_msg,
+            )
+
+        # 7. Validate Coupon
         discount_dec, coupon_error = validate_coupon(db, coupon_code, item_total_dec)
         if coupon_error:
             raise https_fn.HttpsError(https_fn.FunctionsErrorCode.FAILED_PRECONDITION, coupon_error)
 
-        total_dec = max(Decimal('0'), item_total_dec - discount_dec + Decimal(str(DELIVERY_FEE)))
-
-        item_total_val = float(item_total_dec)
         discount_val = float(discount_dec)
-        total_val = float(total_dec)
+
+        # 8. Calculate Authoritative Delivery Fee based on distance slabs
+        delivery_fee = calculate_delivery_fee(delivery_settings, distance_km)
+
+        # 9. Calculate Final Total
+        total_val = round(max(0.0, food_subtotal - discount_val + delivery_fee), 2)
 
         order_ref = db.collection("orders").document()
         order_ref.set({
             "customer_id": req.auth.uid,
             "items": priced_items,
-            "item_total": item_total_val,
-            "delivery_fee": float(DELIVERY_FEE),
+            "item_total": food_subtotal,
+            "delivery_fee": delivery_fee,
+            "delivery_distance_km": distance_km,
+            "minimum_order_value_at_order": parse_float(settings.get("minimum_order_value"), default=150.0),
+            "restaurant_timezone": str(settings.get("timezone", "Asia/Kolkata")),
             "coupon_code": coupon_code,
             "coupon_discount": discount_val,
             "total": total_val,
-            "payment_mode": data.get("payment_mode", "cod"),
-            "payment_status": "pending" if data.get("payment_mode") == "upi" else "cod_pending",
-            "order_status": "pending_payment" if data.get("payment_mode") == "upi" else "placed",
-            "delivery_address": data.get("delivery_address"),
-            "address_label": data.get("address_label"),
-            "latitude": data.get("latitude"),
-            "longitude": data.get("longitude"),
-            "validation_status": "ok",  # server-computed — no need for the audit trigger to re-check
+            "payment_mode": payment_mode,
+            "payment_status": "pending" if payment_mode == "upi" else "cod_pending",
+            "order_status": "pending_payment" if payment_mode == "upi" else "placed",
+            "delivery_address": delivery_address,
+            "address_label": address_label,
+            "latitude": lat,
+            "longitude": lng,
+            "validation_status": "ok",
             "created_at": firestore.SERVER_TIMESTAMP,
         })
 
-        return {"order_id": order_ref.id, "total": total_val}
+        return {"order_id": order_ref.id, "total": total_val, "delivery_fee": delivery_fee, "distance_km": distance_km}
     except https_fn.HttpsError:
         raise
     except Exception as e:
@@ -286,6 +545,52 @@ def place_order(req: https_fn.CallableRequest) -> dict:
             https_fn.FunctionsErrorCode.INTERNAL,
             f"Server error during place_order: {type(e).__name__} - {str(e)}",
         )
+
+
+@https_fn.on_call(region=REGION)
+def get_checkout_preview(req: https_fn.CallableRequest) -> dict:
+    """Calculates server-authoritative delivery distance, delivery fee,
+    minimum order status, and restaurant availability for the Flutter checkout screen."""
+    if req.auth is None:
+        raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
+
+    data = req.data or {}
+    lat = parse_float(data.get("latitude"))
+    lng = parse_float(data.get("longitude"))
+    subtotal = parse_float(data.get("subtotal"))
+
+    db = firestore.client()
+    settings = load_restaurant_settings(db)
+    is_avail, status_code, status_msg = check_restaurant_availability(settings)
+
+    delivery = settings.get("delivery") or {}
+    rest_lat = parse_float(delivery.get("restaurant_latitude"))
+    rest_lng = parse_float(delivery.get("restaurant_longitude"))
+
+    distance_km = 0.0
+    delivery_fee = 30.0
+    is_deliverable = True
+    delivery_msg = ""
+
+    if lat != 0.0 and lng != 0.0 and rest_lat != 0.0 and rest_lng != 0.0:
+        distance_km = calculate_distance_km(rest_lat, rest_lng, lat, lng)
+        is_deliverable, delivery_msg = validate_delivery_distance(delivery, distance_km)
+        delivery_fee = calculate_delivery_fee(delivery, distance_km)
+
+    min_valid, min_msg = validate_minimum_order(settings, subtotal)
+
+    return {
+        "is_available": is_avail,
+        "status_code": status_code,
+        "status_message": status_msg,
+        "distance_km": distance_km,
+        "delivery_fee": delivery_fee,
+        "is_deliverable": is_deliverable,
+        "delivery_message": delivery_msg,
+        "minimum_order_value": parse_float(settings.get("minimum_order_value"), default=150.0),
+        "meets_minimum_order": min_valid,
+        "minimum_order_message": min_msg,
+    }
 
 
 # =======================================================================
@@ -454,7 +759,7 @@ def _find_order_by_razorpay_id(db, razorpay_order_id):
     return docs[0].reference if docs else None
 
 
-@https_fn.on_call(region=REGION, secrets=[RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET])
+@https_fn.on_call(region=REGION, enforce_app_check=True, secrets=[RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET])
 def razorpay_create_order(req: https_fn.CallableRequest) -> dict:
     if req.auth is None:
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
@@ -525,7 +830,7 @@ def razorpay_create_order(req: https_fn.CallableRequest) -> dict:
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.INTERNAL, msg)
 
 
-@https_fn.on_call(region=REGION, secrets=[RAZORPAY_KEY_SECRET])
+@https_fn.on_call(region=REGION, enforce_app_check=True, secrets=[RAZORPAY_KEY_SECRET])
 def razorpay_verify_payment(req: https_fn.CallableRequest) -> dict:
     """Called by the app right after Razorpay reports success. The order only
     becomes `placed` if Razorpay's signature checks out - the app can no longer
@@ -599,12 +904,19 @@ def razorpay_webhook(req: https_fn.Request) -> https_fn.Response:
         return https_fn.Response("Invalid JSON", status=400)
 
     event_type = payload.get("event")
-    payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
+    entities = payload.get("payload", {})
+    payment = entities.get("payment", {}).get("entity", {})
     rzp_order_id = payment.get("order_id")
     payment_id = payment.get("id")
 
     try:
         db = firestore.client()
+
+        # Refund results (see section 6). They carry a refund AND a payment entity.
+        if event_type in ("refund.processed", "refund.failed"):
+            _handle_refund_webhook(db, event_type, entities.get("refund", {}).get("entity", {}), payment_id)
+            return https_fn.Response("OK", status=200)
+
         order_ref = _find_order_by_razorpay_id(db, rzp_order_id)
         if order_ref is None:
             print(f"[RAZORPAY WEBHOOK] {event_type}: no order for {rzp_order_id}")
@@ -656,3 +968,290 @@ def expire_unpaid_orders(event: scheduler_fn.ScheduledEvent) -> None:
                 expired += 1
     if expired:
         print(f"Expired {expired} unpaid online order(s)")
+
+
+# =======================================================================
+# 6. Refunds — Razorpay (UPI)
+#
+# Order fields written here (server only):
+#   refund_status      pending | processed | failed | retry_requested
+#   refund_reason      order_cancelled | late_payment
+#   refund_amount      rupees
+#   refund_id          Razorpay refund id (rfnd_...)
+#   refund_requested_at / refunded_at / refund_error
+#
+# When a refund starts:
+#   * order_status becomes "cancelled" and the UPI payment was captured
+#   * payment_status becomes "paid_needs_refund" (paid after the order expired)
+#   * the admin app sets refund_status to "retry_requested" (Retry button)
+# Cash-on-delivery orders and unpaid orders are never refunded.
+# =======================================================================
+def _rupees(paise) -> float:
+    return float((Decimal(int(paise or 0)) / 100).quantize(Decimal("0.01")))
+
+
+def _fmt_rupees(paise) -> str:
+    value = _rupees(paise)
+    return f"{value:.0f}" if value == int(value) else f"{value:.2f}"
+
+
+def _find_order_by_payment_id(db, payment_id):
+    if not payment_id:
+        return None
+    docs = (
+        db.collection("orders")
+        .where("razorpay_payment_id", "==", payment_id)
+        .limit(1)
+        .get()
+    )
+    return docs[0].reference if docs else None
+
+
+def _send_customer_push(customer_id, body: str, data: dict) -> None:
+    """Best-effort push to the customer's phone (same channel as order updates)."""
+    if not customer_id:
+        return
+    try:
+        db = firestore.client()
+        user_doc = db.collection("users").document(customer_id).get()
+        fcm_token = (user_doc.to_dict() or {}).get("fcm_token") if user_doc.exists else None
+        if not fcm_token:
+            return
+        messaging.send(messaging.Message(
+            notification=messaging.Notification(title="Maruthi Eats", body=body),
+            data={k: str(v) for k, v in data.items()},
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    channel_id="order_status_channel",
+                    priority="high",
+                    default_sound=True,
+                ),
+            ),
+            token=fcm_token,
+        ))
+    except Exception as e:  # noqa: BLE001 - a bad token must never break a refund
+        print(f"Failed to send refund notification to {customer_id}: {e}")
+
+
+@firestore.transactional
+def _claim_refund_txn(transaction, order_ref, reason):
+    """Decides - atomically - whether THIS call may start a refund.
+
+    Returns the Razorpay payment id to refund, or None. Because the status is
+    flipped to `pending` inside the transaction, a re-delivered trigger or a
+    double tap on Retry can never refund twice."""
+    order = order_ref.get(transaction=transaction).to_dict() or {}
+
+    if order.get("payment_mode") != "upi":
+        return None
+    if order.get("refund_status") in ("pending", "processed"):
+        return None
+    if order.get("payment_status") not in ("paid", "paid_needs_refund"):
+        return None  # nothing was paid, nothing to give back
+
+    payment_id = order.get("razorpay_payment_id")
+    if not payment_id:
+        transaction.update(order_ref, {
+            "refund_status": "failed",
+            "refund_reason": reason,
+            "refund_error": "No Razorpay payment id on this order - refund it from the Razorpay dashboard.",
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+        _notify_admin_refund_failed(order_ref.id)
+        return None
+
+    transaction.update(order_ref, {
+        "refund_status": "pending",
+        "refund_reason": reason,
+        "refund_requested_at": firestore.SERVER_TIMESTAMP,
+        "refund_error": firestore.DELETE_FIELD,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    })
+    return payment_id
+
+
+@firestore.transactional
+def _record_refund_created_txn(transaction, order_ref, refund_id, amount_paise):
+    """Razorpay accepted the refund but it is not finished yet. Never moves a
+    refund backwards: the refund.processed webhook may already have arrived."""
+    order = order_ref.get(transaction=transaction).to_dict() or {}
+    if order.get("refund_status") == "processed":
+        return
+    transaction.update(order_ref, {
+        "refund_status": "pending",
+        "refund_id": refund_id,
+        "refund_amount": _rupees(amount_paise),
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    })
+
+
+@firestore.transactional
+def _finish_refund_txn(transaction, order_ref, refund_id, amount_paise):
+    """Marks the refund processed. True only for the call that makes the change."""
+    order = order_ref.get(transaction=transaction).to_dict() or {}
+    if order.get("refund_status") == "processed":
+        return False
+    amount = amount_paise or order.get("razorpay_amount") or 0
+    update = {
+        "refund_status": "processed",
+        "refund_amount": _rupees(amount),
+        "refunded_at": firestore.SERVER_TIMESTAMP,
+        "refund_error": firestore.DELETE_FIELD,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    }
+    if refund_id:
+        update["refund_id"] = refund_id
+    transaction.update(order_ref, update)
+    return True
+
+
+def _finish_refund(db, order_ref, refund_id, amount_paise) -> None:
+    if _finish_refund_txn(db.transaction(), order_ref, refund_id, amount_paise):
+        order = order_ref.get().to_dict() or {}
+        amount = amount_paise or order.get("razorpay_amount") or 0
+        _send_customer_push(
+            order.get("customer_id"),
+            f"Your refund of ₹{_fmt_rupees(amount)} has been processed",
+            {"order_id": order_ref.id, "type": "refund"},
+        )
+
+
+def _notify_admin_refund_failed(order_id: str) -> None:
+    """Normal (visible) notification for the restaurant staff. It deliberately has
+    no `order_id` key, so the admin app does NOT treat it as a new order."""
+    try:
+        messaging.send(messaging.Message(
+            topic="admin_orders",
+            notification=messaging.Notification(
+                title="Refund failed",
+                body=f"Order #{order_id[:6].upper()}: the refund did not go through. "
+                     "Open the order and press Retry.",
+            ),
+            data={"type": "refund_failed", "refund_order_id": order_id},
+            android=messaging.AndroidConfig(priority="high"),
+        ))
+    except Exception as e:  # noqa: BLE001
+        print(f"Failed to send refund-failed alert for {order_id}: {e}")
+
+
+def _fail_refund(order_ref, message: str) -> None:
+    order_ref.update({
+        "refund_status": "failed",
+        "refund_error": message[:200],
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    })
+    _notify_admin_refund_failed(order_ref.id)
+
+
+def _run_refund(db, order_ref, payment_id: str, reason: str) -> None:
+    """Talks to Razorpay. Only ever called after _claim_refund_txn said yes."""
+    try:
+        client, _ = _razorpay_client()
+        payment = client.payment.fetch(payment_id)
+
+        if payment.get("status") not in ("captured", "refunded"):
+            raise RuntimeError(f"payment is '{payment.get('status')}', not captured")
+
+        # Refund exactly what is still refundable. This also makes a retry safe
+        # when an earlier attempt reached Razorpay but its reply was lost.
+        remaining = int(payment.get("amount", 0)) - int(payment.get("amount_refunded") or 0)
+        if remaining <= 0:
+            _finish_refund(db, order_ref, None, int(payment.get("amount_refunded") or 0))
+            return
+
+        refund = client.payment.refund(payment_id, {
+            "amount": remaining,
+            "speed": "optimum",  # instant when Razorpay can, otherwise normal (5-7 working days)
+            "receipt": order_ref.id,
+            "notes": {"firestore_order_id": order_ref.id, "reason": reason},
+        })
+
+        if refund.get("status") == "processed":
+            _finish_refund(db, order_ref, refund.get("id"), remaining)
+        else:
+            _record_refund_created_txn(db.transaction(), order_ref, refund.get("id"), remaining)
+    except Exception as e:  # noqa: BLE001 - surfaced to the admin as a failed refund
+        import traceback
+        traceback.print_exc()
+        text = str(e)
+        if isinstance(e, https_fn.HttpsError):
+            text = e.message
+        _fail_refund(order_ref, f"{type(e).__name__}: {text}")
+
+
+@firestore_fn.on_document_updated(
+    document="orders/{order_id}",
+    region=REGION,
+    secrets=[RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET],
+)
+def on_order_refund_needed(event: firestore_fn.Event) -> None:
+    before = event.data.before.to_dict() or {}
+    after = event.data.after.to_dict() or {}
+
+    reason = None
+    if before.get("order_status") != "cancelled" and after.get("order_status") == "cancelled":
+        reason = "order_cancelled"
+    elif before.get("payment_status") != "paid_needs_refund" and after.get("payment_status") == "paid_needs_refund":
+        reason = "late_payment"
+    elif before.get("refund_status") != "retry_requested" and after.get("refund_status") == "retry_requested":
+        reason = after.get("refund_reason") or "order_cancelled"
+
+    if reason is None or after.get("payment_mode") != "upi":
+        return
+
+    db = firestore.client()
+    order_ref = event.data.after.reference
+    payment_id = _claim_refund_txn(db.transaction(), order_ref, reason)
+    if payment_id:
+        print(f"[REFUND] {order_ref.id}: starting ({reason})")
+        _run_refund(db, order_ref, payment_id, reason)
+
+
+def _handle_refund_webhook(db, event_type, refund, payment_id) -> None:
+    pid = refund.get("payment_id") or payment_id
+    order_ref = _find_order_by_payment_id(db, pid)
+    if order_ref is None:
+        print(f"[RAZORPAY WEBHOOK] {event_type}: no order for payment {pid}")
+        return
+
+    if event_type == "refund.processed":
+        _finish_refund(db, order_ref, refund.get("id"), int(refund.get("amount") or 0))
+    else:  # refund.failed
+        current = order_ref.get().to_dict() or {}
+        if current.get("refund_status") != "processed":
+            _fail_refund(
+                order_ref,
+                "The refund failed at the bank. Press Retry, or refund it from the Razorpay dashboard.",
+            )
+    print(f"[RAZORPAY WEBHOOK] {event_type} {order_ref.id}")
+
+
+@firestore.transactional
+def _fail_stuck_txn(transaction, order_ref):
+    order = order_ref.get(transaction=transaction).to_dict() or {}
+    if order.get("refund_status") == "pending" and not order.get("refund_id"):
+        transaction.update(order_ref, {
+            "refund_status": "failed",
+            "refund_error": "The refund did not complete. Press Retry.",
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+        return True
+    return False
+
+
+@scheduler_fn.on_schedule(schedule="every 30 minutes", region=REGION)
+def fail_stuck_refunds(event: scheduler_fn.ScheduledEvent) -> None:
+    """A refund that was claimed but never reached Razorpay (no refund_id after
+    15 minutes, e.g. the function crashed) is shown as failed so the admin can
+    retry it. A refund that Razorpay accepted can legitimately stay `pending`
+    for days, so those are left alone."""
+    db = firestore.client()
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+    for doc in db.collection("orders").where("refund_status", "==", "pending").get():
+        data = doc.to_dict() or {}
+        requested = data.get("refund_requested_at")
+        if not data.get("refund_id") and requested is not None and requested < cutoff:
+            if _fail_stuck_txn(db.transaction(), doc.reference):
+                print(f"[REFUND] {doc.id}: marked failed (never reached Razorpay)")
+                _notify_admin_refund_failed(doc.id)

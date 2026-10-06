@@ -38,9 +38,21 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
+    // ── /settings/{settingId} ────────────────────────────────
+    match /settings/{settingId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ── /banners/{bannerId} ───────────────────────────────────
+    match /banners/{bannerId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
     // ── /coupons/{couponId} ──────────────────────────────────
     match /coupons/{couponId} {
-      allow read: if isSignedIn();
+      allow read: if isAdmin() || (isSignedIn() && resource.data.is_active == true);
       allow write: if isAdmin();
     }
 
@@ -54,10 +66,10 @@ service cloud.firestore {
     match /orders/{orderId} {
       allow read: if isAdmin() || (isSignedIn() && resource.data.customer_id == request.auth.uid);
 
-      allow create: if isSignedIn()
-                    && request.resource.data.customer_id == request.auth.uid
-                    && request.resource.data.order_status == 'placed'
-                    && request.resource.data.payment_status in ['pending', 'cod_pending'];
+      // Orders are created ONLY by the place_order Cloud Function (Admin SDK,
+      // which bypasses these rules) so prices, offers and totals are always
+      // computed on the server. The app can never create an order itself.
+      allow create: if false;
 
       allow update: if isAdmin()
                     || (isSignedIn()
