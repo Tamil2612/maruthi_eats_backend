@@ -1255,3 +1255,44 @@ def fail_stuck_refunds(event: scheduler_fn.ScheduledEvent) -> None:
             if _fail_stuck_txn(db.transaction(), doc.reference):
                 print(f"[REFUND] {doc.id}: marked failed (never reached Razorpay)")
                 _notify_admin_refund_failed(doc.id)
+
+
+@https_fn.on_call(region=REGION, enforce_app_check=True)
+def delete_account(req: https_fn.CallableRequest) -> dict:
+    if req.auth is None:
+        raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
+
+    uid = req.auth.uid
+    db = firestore.client()
+
+    try:
+        # 1. Delete user subcollections (e.g. addresses)
+        addresses_ref = db.collection("users").document(uid).collection("addresses").get()
+        for doc in addresses_ref:
+            doc.reference.delete()
+
+        # 2. Delete user profile doc
+        db.collection("users").document(uid).delete()
+
+        # 3. Anonymize historical orders PII to preserve accounting records
+        orders_ref = db.collection("orders").where("customer_id", "==", uid).get()
+        anonymized_id = f"anonymized_{uid[:8]}"
+        for order_doc in orders_ref:
+            order_doc.reference.update({
+                "customer_id": anonymized_id,
+                "delivery_address": "Anonymized Address",
+            })
+
+        # 4. Delete Firebase Auth user
+        auth.delete_user(uid)
+
+        return {"status": "success", "message": "Account successfully deleted."}
+    except https_fn.HttpsError:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.INTERNAL,
+            f"Error deleting account: {str(e)}",
+        )
