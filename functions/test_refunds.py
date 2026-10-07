@@ -147,7 +147,7 @@ class RefundTests(unittest.TestCase):
         main._send_customer_push = lambda cid, body, data: self.pushes.append((cid, body))
         self.admin_alerts = []
         main._notify_admin_refund_failed = lambda oid: self.admin_alerts.append(oid)
-        self.rzp = FakeRazorpay({"status": "captured", "amount": 27000, "amount_refunded": 0})
+        self.rzp = FakeRazorpay({"status": "captured", "amount": 27000, "amount_refunded": 0, "currency": "INR"})
         main._razorpay_client = lambda: (self.rzp, "rzp_test_x")
 
     def order(self, oid="o1", **kw):

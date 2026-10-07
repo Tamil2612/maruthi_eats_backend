@@ -932,6 +932,46 @@ def razorpay_verify_payment(req: https_fn.CallableRequest) -> dict:
             raise https_fn.HttpsError(https_fn.FunctionsErrorCode.PERMISSION_DENIED,
                                       "Payment signature could not be verified")
 
+        client, key_id = _razorpay_client()
+        try:
+            payment = client.payment.fetch(payment_id)
+        except Exception as p_err:
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                f"Could not fetch payment details from Razorpay: {p_err}",
+            )
+
+        stored_rzp_order_id = order.get("razorpay_order_id") or rzp_order_id
+        p_order_id = payment.get("order_id")
+        if p_order_id and p_order_id != stored_rzp_order_id:
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+                "Payment does not belong to this Razorpay order",
+            )
+
+        stored_amount_paise = order.get("razorpay_amount")
+        if stored_amount_paise is None:
+            stored_amount_paise = int((Decimal(str(parse_float(order.get("total", 0)))) * 100).to_integral_value())
+
+        p_amount = parse_int(payment.get("amount"))
+        if p_amount != stored_amount_paise:
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                f"Payment amount ({p_amount}) does not match expected order amount ({stored_amount_paise})",
+            )
+
+        if payment.get("currency") != "INR":
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                "Invalid payment currency",
+            )
+
+        if payment.get("status") != "captured":
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                f"Payment status is '{payment.get('status')}', not captured",
+            )
+
         status = _mark_paid_txn(db.transaction(), order_ref, payment_id)
         return {"status": status}
     except https_fn.HttpsError:
@@ -983,8 +1023,22 @@ def razorpay_webhook(req: https_fn.Request) -> https_fn.Response:
         if order_ref is None:
             print(f"[RAZORPAY WEBHOOK] {event_type}: no order for {rzp_order_id}")
         elif event_type in ("payment.captured", "order.paid"):
-            result = _mark_paid_txn(db.transaction(), order_ref, payment_id)
-            print(f"[RAZORPAY WEBHOOK] {event_type} {order_ref.id}: {result}")
+            snap = order_ref.get().to_dict() or {}
+            stored_amount_paise = snap.get("razorpay_amount")
+            if stored_amount_paise is None:
+                stored_amount_paise = int((Decimal(str(parse_float(snap.get("total", 0)))) * 100).to_integral_value())
+
+            p_amount = parse_int(payment.get("amount"))
+            p_currency = payment.get("currency")
+            p_status = payment.get("status")
+
+            if (p_currency == "INR" and
+                p_status in ("captured", "authorized") and
+                (p_amount == stored_amount_paise or p_amount == 0)):
+                result = _mark_paid_txn(db.transaction(), order_ref, payment_id)
+                print(f"[RAZORPAY WEBHOOK] {event_type} {order_ref.id}: {result}")
+            else:
+                print(f"[RAZORPAY WEBHOOK REJECTED] {event_type} {order_ref.id}: amount={p_amount} vs {stored_amount_paise}, status={p_status}")
         elif event_type == "payment.failed":
             # The customer may retry on the same Razorpay order, so the order
             # stays `pending_payment`; just record the failed attempt.
@@ -1401,6 +1455,245 @@ def delete_account(req: https_fn.CallableRequest) -> dict:
     except Exception as e:
         ref_id = _generate_ref_id()
         print(f"[INTERNAL ERROR] delete_account ref={ref_id}: {type(e).__name__} - {e}")
+        traceback.print_exc()
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.INTERNAL,
+            f"Something went wrong. Please try again. (ref {ref_id})",
+        )
+
+
+def _require_staff(db, uid: str) -> None:
+    staff_doc = db.collection("staff").document(uid).get()
+    if not staff_doc.exists:
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+            "Access denied: Admin/staff privileges required.",
+        )
+
+
+@https_fn.on_call(region=REGION)
+def update_order_status(req: https_fn.CallableRequest) -> dict:
+    if req.auth is None:
+        raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
+
+    try:
+        db = firestore.client()
+        _require_staff(db, req.auth.uid)
+
+        data = req.data or {}
+        order_id = str(data.get("order_id") or "").strip()
+        new_status = str(data.get("order_status") or "").strip().lower()
+
+        valid_statuses = ["placed", "confirmed", "preparing", "out_for_delivery", "delivered", "cancelled"]
+        if not order_id or new_status not in valid_statuses:
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.INVALID_ARGUMENT, f"Invalid order_id or order_status: {new_status}")
+
+        order_ref = db.collection("orders").document(order_id)
+        order_doc = order_ref.get()
+        if not order_doc.exists:
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.NOT_FOUND, "Order not found")
+
+        # Update ONLY allowed fields
+        order_ref.update({
+            "order_status": new_status,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+            "updated_by": req.auth.uid,
+            "status_changed_by": req.auth.uid,
+        })
+
+        # Append to status_log subcollection
+        order_ref.collection("status_log").add({
+            "status": new_status,
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "changed_by": req.auth.uid,
+        })
+
+        return {"order_id": order_id, "order_status": new_status}
+    except https_fn.HttpsError:
+        raise
+    except Exception as e:
+        ref_id = _generate_ref_id()
+        print(f"[INTERNAL ERROR] update_order_status ref={ref_id}: {type(e).__name__} - {e}")
+        traceback.print_exc()
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.INTERNAL,
+            f"Something went wrong. Please try again. (ref {ref_id})",
+        )
+
+
+@https_fn.on_call(region=REGION)
+def mark_cod_collected(req: https_fn.CallableRequest) -> dict:
+    if req.auth is None:
+        raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
+
+    try:
+        db = firestore.client()
+        _require_staff(db, req.auth.uid)
+
+        data = req.data or {}
+        order_id = str(data.get("order_id") or "").strip()
+
+        order_ref = db.collection("orders").document(order_id)
+        order_doc = order_ref.get()
+        if not order_doc.exists:
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.NOT_FOUND, "Order not found")
+
+        order = order_doc.to_dict() or {}
+        if order.get("payment_mode") != "cod":
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.FAILED_PRECONDITION, "Order is not a Cash on Delivery order")
+
+        # Update ONLY allowed fields
+        order_ref.update({
+            "payment_status": "paid",
+            "updated_at": firestore.SERVER_TIMESTAMP,
+            "updated_by": req.auth.uid,
+        })
+
+        return {"order_id": order_id, "payment_status": "paid"}
+    except https_fn.HttpsError:
+        raise
+    except Exception as e:
+        ref_id = _generate_ref_id()
+        print(f"[INTERNAL ERROR] mark_cod_collected ref={ref_id}: {type(e).__name__} - {e}")
+        traceback.print_exc()
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.INTERNAL,
+            f"Something went wrong. Please try again. (ref {ref_id})",
+        )
+
+
+@https_fn.on_call(region=REGION)
+def cancel_order(req: https_fn.CallableRequest) -> dict:
+    if req.auth is None:
+        raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
+
+    try:
+        db = firestore.client()
+        data = req.data or {}
+        order_id = str(data.get("order_id") or "").strip()
+        reason = str(data.get("reason") or "Order cancelled").strip()[:200]
+
+        order_ref = db.collection("orders").document(order_id)
+        order_doc = order_ref.get()
+        if not order_doc.exists:
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.NOT_FOUND, "Order not found")
+
+        order = order_doc.to_dict() or {}
+        is_staff = db.collection("staff").document(req.auth.uid).get().exists
+        is_owner = order.get("customer_id") == req.auth.uid
+
+        if not is_staff and not is_owner:
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.PERMISSION_DENIED, "Permission denied")
+
+        if not is_staff and order.get("order_status") != "placed":
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.FAILED_PRECONDITION, "Orders in progress cannot be cancelled by customer")
+
+        # Update ONLY allowed fields
+        order_ref.update({
+            "order_status": "cancelled",
+            "cancel_reason": reason,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+            "updated_by": req.auth.uid,
+        })
+
+        order_ref.collection("status_log").add({
+            "status": "cancelled",
+            "reason": reason,
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "changed_by": req.auth.uid,
+        })
+
+        return {"order_id": order_id, "order_status": "cancelled"}
+    except https_fn.HttpsError:
+        raise
+    except Exception as e:
+        ref_id = _generate_ref_id()
+        print(f"[INTERNAL ERROR] cancel_order ref={ref_id}: {type(e).__name__} - {e}")
+        traceback.print_exc()
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.INTERNAL,
+            f"Something went wrong. Please try again. (ref {ref_id})",
+        )
+
+
+@https_fn.on_call(region=REGION)
+def retry_refund(req: https_fn.CallableRequest) -> dict:
+    if req.auth is None:
+        raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
+
+    try:
+        db = firestore.client()
+        _require_staff(db, req.auth.uid)
+
+        data = req.data or {}
+        order_id = str(data.get("order_id") or "").strip()
+
+        order_ref = db.collection("orders").document(order_id)
+        order_doc = order_ref.get()
+        if not order_doc.exists:
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.NOT_FOUND, "Order not found")
+
+        order = order_doc.to_dict() or {}
+        if order.get("refund_status") != "failed":
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.FAILED_PRECONDITION, "Only failed refunds can be retried")
+
+        order_ref.update({
+            "refund_status": "retry_requested",
+            "updated_at": firestore.SERVER_TIMESTAMP,
+            "updated_by": req.auth.uid,
+        })
+
+        return {"order_id": order_id, "refund_status": "retry_requested"}
+    except https_fn.HttpsError:
+        raise
+    except Exception as e:
+        ref_id = _generate_ref_id()
+        print(f"[INTERNAL ERROR] retry_refund ref={ref_id}: {type(e).__name__} - {e}")
+        traceback.print_exc()
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.INTERNAL,
+            f"Something went wrong. Please try again. (ref {ref_id})",
+        )
+
+
+@https_fn.on_call(region=REGION)
+def submit_order_rating(req: https_fn.CallableRequest) -> dict:
+    if req.auth is None:
+        raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
+
+    try:
+        data = req.data or {}
+        order_id = str(data.get("order_id") or "").strip()
+        rating = parse_int(data.get("rating"), default=0)
+
+        if not order_id or rating < 1 or rating > 5:
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.INVALID_ARGUMENT, "Valid order_id and rating (1-5) required")
+
+        db = firestore.client()
+        order_ref = db.collection("orders").document(order_id)
+        order_doc = order_ref.get()
+
+        if not order_doc.exists:
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.NOT_FOUND, "Order not found")
+
+        order = order_doc.to_dict() or {}
+        if order.get("customer_id") != req.auth.uid:
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.PERMISSION_DENIED, "Not your order")
+
+        if order.get("order_status") != "delivered":
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.FAILED_PRECONDITION, "Only delivered orders can be rated")
+
+        order_ref.update({
+            "rating": rating,
+            "rating_submitted_at": firestore.SERVER_TIMESTAMP,
+        })
+
+        return {"status": "success", "rating": rating}
+    except https_fn.HttpsError:
+        raise
+    except Exception as e:
+        ref_id = _generate_ref_id()
+        print(f"[INTERNAL ERROR] submit_order_rating ref={ref_id}: {type(e).__name__} - {e}")
         traceback.print_exc()
         raise https_fn.HttpsError(
             https_fn.FunctionsErrorCode.INTERNAL,

@@ -66,38 +66,15 @@ service cloud.firestore {
     match /orders/{orderId} {
       allow read: if isAdmin() || (isSignedIn() && resource.data.customer_id == request.auth.uid);
 
-      // Orders are created ONLY by the place_order Cloud Function (Admin SDK,
-      // which bypasses these rules) so prices, offers and totals are always
-      // computed on the server. The app can never create an order itself.
-      allow create: if false;
-
-      allow update: if isAdmin()
-                    || (isSignedIn()
-                        && resource.data.customer_id == request.auth.uid
-                        && (
-                          // Cancel a still-placed order
-                          (resource.data.order_status == 'placed'
-                            && request.resource.data.order_status == 'cancelled'
-                            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['order_status', 'updated_at']))
-                          ||
-                          // FIX: order_tracking_screen.dart's _submitRating() writes
-                          // {'rating': _rating} directly from the customer's own client
-                          // once order_status == 'delivered'. Without this branch, every
-                          // rating submission hits a permission-denied error and the
-                          // "Submit Rating" button can never succeed.
-                          (resource.data.order_status == 'delivered'
-                            && request.resource.data.rating is int
-                            && request.resource.data.rating >= 1
-                            && request.resource.data.rating <= 5
-                            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['rating']))
-                        ));
-
-      allow delete: if false;
+      // Orders, status changes, payments, refunds, and ratings are managed strictly
+      // by server-side Callable Cloud Functions (Admin SDK). Client SDKs cannot
+      // create, update, or delete order documents directly.
+      allow create, update, delete: if false;
 
       match /status_log/{logId} {
         allow read: if isAdmin()
                     || (isSignedIn() && get(/databases/$(database)/documents/orders/$(orderId)).data.customer_id == request.auth.uid);
-        allow write: if isAdmin();
+        allow write: if false;
       }
     }
 
