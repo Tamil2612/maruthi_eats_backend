@@ -43,6 +43,11 @@ class FakeRef:
     def set(self, data):
         self.db.data.setdefault(self.coll, {})[self.id] = data
 
+    def update(self, changes):
+        doc = self.db.data.setdefault(self.coll, {}).get(self.id, {})
+        doc.update(changes)
+        self.db.data[self.coll][self.id] = doc
+
 
 class FakeQuery:
     def __init__(self, docs):
@@ -166,13 +171,8 @@ class RestaurantBusinessRulesTests(unittest.TestCase):
 
     # 3. Outside opening hours rejects order
     def test_outside_opening_hours_rejects_order(self):
-        self.db.data["settings"]["restaurant"]["opening_hours"]["monday"] = {
-            "enabled": True,
-            "open": "02:00",
-            "close": "03:00",
-        }
-        # Fake Tuesday disabled or closed range
-        self.db.data["settings"]["restaurant"]["opening_hours"]["tuesday"] = {"enabled": False}
+        for day in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]:
+            self.db.data["settings"]["restaurant"]["opening_hours"][day] = {"enabled": False}
         self.rejects([{"item_id": "A", "qty": 2}])
 
     # 4. Manual pause rejects order
@@ -284,6 +284,48 @@ class RestaurantBusinessRulesTests(unittest.TestCase):
         # Historical order document in DB retains orig_fee
         stored_order = self.db.data["orders"][out["order_id"]]
         self.assertEqual(stored_order["delivery_fee"], orig_fee)
+
+    # 20. Audit does not flag legitimate orders placed at various distance slabs (1km, 4km, 6.5km)
+    def test_audit_does_not_flag_legitimate_slab_orders(self):
+        # 1 km (~30 fee)
+        out1, order1 = self.place([{"item_id": "A", "qty": 2}], lat=13.0827, lng=80.2707)
+        req_event1 = SimpleNamespace(data=SimpleNamespace(to_dict=lambda: order1), params={"order_id": out1["order_id"]})
+        inspect.unwrap(main.on_order_created)(req_event1)
+        self.assertEqual(self.db.data["orders"][out1["order_id"]]["validation_status"], "ok")
+
+        # 4 km (~40 fee)
+        out2, order2 = self.place([{"item_id": "A", "qty": 2}], lat=13.1180, lng=80.2707)
+        req_event2 = SimpleNamespace(data=SimpleNamespace(to_dict=lambda: order2), params={"order_id": out2["order_id"]})
+        inspect.unwrap(main.on_order_created)(req_event2)
+        self.assertEqual(self.db.data["orders"][out2["order_id"]]["validation_status"], "ok")
+
+        # 6.5 km (~60 fee)
+        out3, order3 = self.place([{"item_id": "A", "qty": 2}], lat=13.1410, lng=80.2707)
+        req_event3 = SimpleNamespace(data=SimpleNamespace(to_dict=lambda: order3), params={"order_id": out3["order_id"]})
+        inspect.unwrap(main.on_order_created)(req_event3)
+        self.assertEqual(self.db.data["orders"][out3["order_id"]]["validation_status"], "ok")
+
+    # 21. Abandon UPI, then COD immediately works
+    def test_abandon_upi_then_cod_immediately_works(self):
+        out1, order1 = self.place([{"item_id": "A", "qty": 2}], payment_mode="upi")
+        self.assertEqual(order1["order_status"], "pending_payment")
+
+        out2, order2 = self.place([{"item_id": "A", "qty": 2}], payment_mode="cod")
+        self.assertEqual(order2["order_status"], "placed")
+
+    # 22. Many unpaid attempts are limited
+    def test_many_unpaid_attempts_limited(self):
+        now = datetime.now(timezone.utc)
+        for i in range(5):
+            self.db.data["orders"][f"p{i}"] = {
+                "customer_id": "u1",
+                "order_status": "pending_payment",
+                "created_at": now,
+            }
+
+        with self.assertRaises(https_fn.HttpsError) as cm:
+            self.place([{"item_id": "A", "qty": 2}], payment_mode="upi")
+        self.assertIn("Too many unpaid payment attempts", str(cm.exception.message))
 
     def assertGreaterThan(self, a, b):
         self.assertTrue(a > b)

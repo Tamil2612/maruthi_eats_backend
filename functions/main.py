@@ -46,10 +46,12 @@ import hashlib
 import hmac
 import json
 import os
+import traceback
+import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from firebase_admin import initialize_app, firestore, messaging
+from firebase_admin import initialize_app, firestore, messaging, auth
 from firebase_functions import firestore_fn, https_fn, scheduler_fn, options, params
 import razorpay
 
@@ -189,7 +191,27 @@ def on_order_created(event: firestore_fn.Event) -> None:
             f"expected {discount}"
         )
 
-    expected_total = max(Decimal('0'), recomputed_item_total - discount + Decimal(str(DELIVERY_FEE)))
+    # Recompute delivery fee based on stored distance and slabs
+    stored_delivery_fee = parse_float(order.get("delivery_fee"), default=30.0)
+    stored_distance = order.get("delivery_distance_km")
+
+    if stored_distance is not None:
+        distance_km = parse_float(stored_distance, default=0.0)
+        settings = load_restaurant_settings(db)
+        delivery_settings = settings.get("delivery") or {}
+        expected_fee = calculate_delivery_fee(delivery_settings, distance_km)
+
+        if abs(stored_delivery_fee - expected_fee) > 0.01:
+            problems.append(
+                f"Stored delivery_fee ₹{stored_delivery_fee} does not match "
+                f"expected fee ₹{expected_fee} for distance {distance_km} km"
+            )
+        fee_for_total = Decimal(str(stored_delivery_fee))
+    else:
+        # Fall back to 30.0 for legacy orders without distance fields
+        fee_for_total = Decimal(str(stored_delivery_fee if "delivery_fee" in order else 30.0))
+
+    expected_total = max(Decimal('0'), recomputed_item_total - discount + fee_for_total)
     submitted_total = Decimal(str(order.get("total") or 0))
     if abs(expected_total - submitted_total) > Decimal('0.01'):
         problems.append(f"Submitted total {submitted_total} does not match expected {expected_total}")
@@ -239,38 +261,65 @@ def place_order(req: https_fn.CallableRequest) -> dict:
         # 0. Anti-abuse rate limiting & active orders cap
         now_utc = datetime.now(timezone.utc)
 
-        # Check active orders count (max 3 active/pending orders per customer to prevent COD spamming)
-        active_orders = (
+        # Check real active orders count (max 3 active real orders per customer)
+        active_real_orders = (
             db.collection("orders")
             .where("customer_id", "==", req.auth.uid)
-            .where("order_status", "in", ["placed", "confirmed", "preparing", "out_for_delivery", "pending_payment"])
+            .where("order_status", "in", ["placed", "confirmed", "preparing", "out_for_delivery"])
             .get()
         )
-        if len(active_orders) >= 3:
+        if len(active_real_orders) >= 3:
             raise https_fn.HttpsError(
                 https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
-                "You have 3 or more active orders. Please wait for your current orders to be delivered before placing a new one.",
+                "You have 3 active orders in progress. Please wait for them to be delivered before placing a new order.",
             )
 
-        # Check order frequency cooldown (at least 60 seconds between consecutive orders)
-        recent_orders = (
+        # Separate cap on unpaid pending attempts (max 5 in 30 minutes)
+        cutoff_30m = now_utc - timedelta(minutes=30)
+        recent_pending_orders = (
             db.collection("orders")
             .where("customer_id", "==", req.auth.uid)
-            .order_by("created_at", direction=firestore.Query.DESCENDING)
-            .limit(1)
+            .where("order_status", "==", "pending_payment")
             .get()
         )
-        if recent_orders:
-            last_order = recent_orders[0].to_dict() or {}
-            created_at = last_order.get("created_at")
+        unpaid_attempts_30m = 0
+        for doc in recent_pending_orders:
+            od_data = doc.to_dict() or {}
+            created_at = od_data.get("created_at")
             if isinstance(created_at, datetime):
                 if created_at.tzinfo is None:
                     created_at = created_at.replace(tzinfo=timezone.utc)
-                if (now_utc - created_at).total_seconds() < 60:
-                    raise https_fn.HttpsError(
-                        https_fn.FunctionsErrorCode.RESOURCE_EXHAUSTED,
-                        "Please wait at least 60 seconds before placing another order.",
-                    )
+                if created_at >= cutoff_30m:
+                    unpaid_attempts_30m += 1
+
+        if unpaid_attempts_30m >= 5:
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.RESOURCE_EXHAUSTED,
+                "Too many unpaid payment attempts. Please wait a few minutes or choose Cash on Delivery.",
+            )
+
+        # Check 60-second cooldown on real orders (ignoring pending_payment / payment_expired)
+        recent_user_orders = (
+            db.collection("orders")
+            .where("customer_id", "==", req.auth.uid)
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(10)
+            .get()
+        )
+        for doc in recent_user_orders:
+            last_order = doc.to_dict() or {}
+            st = last_order.get("order_status")
+            if st not in ("pending_payment", "payment_expired"):
+                created_at = last_order.get("created_at")
+                if isinstance(created_at, datetime):
+                    if created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
+                    if (now_utc - created_at).total_seconds() < 60:
+                        raise https_fn.HttpsError(
+                            https_fn.FunctionsErrorCode.RESOURCE_EXHAUSTED,
+                            "Please wait at least 60 seconds before placing another order.",
+                        )
+                break  # Newest real order checked
 
         # 1. Validate payment_mode strictly
         payment_mode = str(data.get("payment_mode") or "cod").lower().strip()
@@ -539,11 +588,12 @@ def place_order(req: https_fn.CallableRequest) -> dict:
     except https_fn.HttpsError:
         raise
     except Exception as e:
-        import traceback
+        ref_id = _generate_ref_id()
+        print(f"[INTERNAL ERROR] place_order ref={ref_id}: {type(e).__name__} - {e}")
         traceback.print_exc()
         raise https_fn.HttpsError(
             https_fn.FunctionsErrorCode.INTERNAL,
-            f"Server error during place_order: {type(e).__name__} - {str(e)}",
+            f"Something went wrong. Please try again. (ref {ref_id})",
         )
 
 
@@ -554,43 +604,54 @@ def get_checkout_preview(req: https_fn.CallableRequest) -> dict:
     if req.auth is None:
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
 
-    data = req.data or {}
-    lat = parse_float(data.get("latitude"))
-    lng = parse_float(data.get("longitude"))
-    subtotal = parse_float(data.get("subtotal"))
+    try:
+        data = req.data or {}
+        lat = parse_float(data.get("latitude"))
+        lng = parse_float(data.get("longitude"))
+        subtotal = parse_float(data.get("subtotal"))
 
-    db = firestore.client()
-    settings = load_restaurant_settings(db)
-    is_avail, status_code, status_msg = check_restaurant_availability(settings)
+        db = firestore.client()
+        settings = load_restaurant_settings(db)
+        is_avail, status_code, status_msg = check_restaurant_availability(settings)
 
-    delivery = settings.get("delivery") or {}
-    rest_lat = parse_float(delivery.get("restaurant_latitude"))
-    rest_lng = parse_float(delivery.get("restaurant_longitude"))
+        delivery = settings.get("delivery") or {}
+        rest_lat = parse_float(delivery.get("restaurant_latitude"))
+        rest_lng = parse_float(delivery.get("restaurant_longitude"))
 
-    distance_km = 0.0
-    delivery_fee = 30.0
-    is_deliverable = True
-    delivery_msg = ""
+        distance_km = 0.0
+        delivery_fee = 30.0
+        is_deliverable = True
+        delivery_msg = ""
 
-    if lat != 0.0 and lng != 0.0 and rest_lat != 0.0 and rest_lng != 0.0:
-        distance_km = calculate_distance_km(rest_lat, rest_lng, lat, lng)
-        is_deliverable, delivery_msg = validate_delivery_distance(delivery, distance_km)
-        delivery_fee = calculate_delivery_fee(delivery, distance_km)
+        if lat != 0.0 and lng != 0.0 and rest_lat != 0.0 and rest_lng != 0.0:
+            distance_km = calculate_distance_km(rest_lat, rest_lng, lat, lng)
+            is_deliverable, delivery_msg = validate_delivery_distance(delivery, distance_km)
+            delivery_fee = calculate_delivery_fee(delivery, distance_km)
 
-    min_valid, min_msg = validate_minimum_order(settings, subtotal)
+        min_valid, min_msg = validate_minimum_order(settings, subtotal)
 
-    return {
-        "is_available": is_avail,
-        "status_code": status_code,
-        "status_message": status_msg,
-        "distance_km": distance_km,
-        "delivery_fee": delivery_fee,
-        "is_deliverable": is_deliverable,
-        "delivery_message": delivery_msg,
-        "minimum_order_value": parse_float(settings.get("minimum_order_value"), default=150.0),
-        "meets_minimum_order": min_valid,
-        "minimum_order_message": min_msg,
-    }
+        return {
+            "is_available": is_avail,
+            "status_code": status_code,
+            "status_message": status_msg,
+            "distance_km": distance_km,
+            "delivery_fee": delivery_fee,
+            "is_deliverable": is_deliverable,
+            "delivery_message": delivery_msg,
+            "minimum_order_value": parse_float(settings.get("minimum_order_value"), default=150.0),
+            "meets_minimum_order": min_valid,
+            "minimum_order_message": min_msg,
+        }
+    except https_fn.HttpsError:
+        raise
+    except Exception as e:
+        ref_id = _generate_ref_id()
+        print(f"[INTERNAL ERROR] get_checkout_preview ref={ref_id}: {type(e).__name__} - {e}")
+        traceback.print_exc()
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.INTERNAL,
+            f"Something went wrong. Please try again. (ref {ref_id})",
+        )
 
 
 # =======================================================================
@@ -821,13 +882,13 @@ def razorpay_create_order(req: https_fn.CallableRequest) -> dict:
     except https_fn.HttpsError:
         raise
     except Exception as e:
-        import traceback
-        traceback.print_exc()  # full detail goes to the function logs
-        if "Authentication failed" in str(e):
-            msg = "Payment gateway keys are not set up correctly."
-        else:
-            msg = f"Could not start payment ({type(e).__name__}). Please try again."
-        raise https_fn.HttpsError(https_fn.FunctionsErrorCode.INTERNAL, msg)
+        ref_id = _generate_ref_id()
+        print(f"[INTERNAL ERROR] razorpay_create_order ref={ref_id}: {type(e).__name__} - {e}")
+        traceback.print_exc()
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.INTERNAL,
+            f"Something went wrong. Please try again. (ref {ref_id})",
+        )
 
 
 @https_fn.on_call(region=REGION, enforce_app_check=True, secrets=[RAZORPAY_KEY_SECRET])
@@ -876,11 +937,12 @@ def razorpay_verify_payment(req: https_fn.CallableRequest) -> dict:
     except https_fn.HttpsError:
         raise
     except Exception as e:
-        import traceback
+        ref_id = _generate_ref_id()
+        print(f"[INTERNAL ERROR] razorpay_verify_payment ref={ref_id}: {type(e).__name__} - {e}")
         traceback.print_exc()
         raise https_fn.HttpsError(
             https_fn.FunctionsErrorCode.INTERNAL,
-            f"Could not confirm payment ({type(e).__name__}).",
+            f"Something went wrong. Please try again. (ref {ref_id})",
         )
 
 
@@ -1257,7 +1319,7 @@ def fail_stuck_refunds(event: scheduler_fn.ScheduledEvent) -> None:
                 _notify_admin_refund_failed(doc.id)
 
 
-@https_fn.on_call(region=REGION, enforce_app_check=True)
+@https_fn.on_call(region=REGION)
 def delete_account(req: https_fn.CallableRequest) -> dict:
     if req.auth is None:
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
@@ -1265,34 +1327,82 @@ def delete_account(req: https_fn.CallableRequest) -> dict:
     uid = req.auth.uid
     db = firestore.client()
 
+    # 1. Check for active orders or pending refunds before deleting anything
+    active_orders = (
+        db.collection("orders")
+        .where("customer_id", "==", uid)
+        .where("order_status", "in", ["placed", "confirmed", "preparing", "out_for_delivery", "pending_payment"])
+        .get()
+    )
+    pending_refunds = (
+        db.collection("orders")
+        .where("customer_id", "==", uid)
+        .where("refund_status", "==", "pending")
+        .get()
+    )
+
+    if active_orders or pending_refunds:
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+            "You have an order or refund in progress. Please wait for it to complete before deleting your account.",
+        )
+
     try:
-        # 1. Delete user subcollections (e.g. addresses)
+        # 2. Delete user subcollections (e.g. addresses) using batch
+        batch = db.batch()
+        batch_count = 0
+
         addresses_ref = db.collection("users").document(uid).collection("addresses").get()
         for doc in addresses_ref:
-            doc.reference.delete()
+            batch.delete(doc.reference)
+            batch_count += 1
+            if batch_count >= 400:
+                batch.commit()
+                batch = db.batch()
+                batch_count = 0
 
-        # 2. Delete user profile doc
-        db.collection("users").document(uid).delete()
+        # 3. Delete user profile doc
+        user_doc_ref = db.collection("users").document(uid)
+        if user_doc_ref.get().exists:
+            batch.delete(user_doc_ref)
+            batch_count += 1
 
-        # 3. Anonymize historical orders PII to preserve accounting records
+        # 4. Anonymize historical orders (PII removed, preserving financial/sales records)
         orders_ref = db.collection("orders").where("customer_id", "==", uid).get()
         anonymized_id = f"anonymized_{uid[:8]}"
+
         for order_doc in orders_ref:
-            order_doc.reference.update({
+            batch.update(order_doc.reference, {
                 "customer_id": anonymized_id,
                 "delivery_address": "Anonymized Address",
+                "address_label": "Anonymized",
+                "latitude": None,
+                "longitude": None,
             })
+            batch_count += 1
+            if batch_count >= 400:
+                batch.commit()
+                batch = db.batch()
+                batch_count = 0
 
-        # 4. Delete Firebase Auth user
-        auth.delete_user(uid)
+        if batch_count > 0:
+            batch.commit()
+
+        # 5. Delete Firebase Auth user LAST (idempotent / safe to retry)
+        try:
+            auth.delete_user(uid)
+        except Exception as auth_err:
+            if "NOT_FOUND" not in str(auth_err) and "UserNotFoundError" not in type(auth_err).__name__:
+                print(f"[DELETE ACCOUNT] Auth delete notice: {auth_err}")
 
         return {"status": "success", "message": "Account successfully deleted."}
     except https_fn.HttpsError:
         raise
     except Exception as e:
-        import traceback
+        ref_id = _generate_ref_id()
+        print(f"[INTERNAL ERROR] delete_account ref={ref_id}: {type(e).__name__} - {e}")
         traceback.print_exc()
         raise https_fn.HttpsError(
             https_fn.FunctionsErrorCode.INTERNAL,
-            f"Error deleting account: {str(e)}",
+            f"Something went wrong. Please try again. (ref {ref_id})",
         )
