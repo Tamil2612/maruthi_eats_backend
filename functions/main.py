@@ -891,7 +891,7 @@ def razorpay_create_order(req: https_fn.CallableRequest) -> dict:
         )
 
 
-@https_fn.on_call(region=REGION, enforce_app_check=True, secrets=[RAZORPAY_KEY_SECRET])
+@https_fn.on_call(region=REGION, enforce_app_check=True, secrets=[RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET])
 def razorpay_verify_payment(req: https_fn.CallableRequest) -> dict:
     """Called by the app right after Razorpay reports success. The order only
     becomes `placed` if Razorpay's signature checks out - the app can no longer
@@ -936,9 +936,10 @@ def razorpay_verify_payment(req: https_fn.CallableRequest) -> dict:
         try:
             payment = client.payment.fetch(payment_id)
         except Exception as p_err:
+            print(f"[RAZORPAY] could not fetch payment {payment_id}: {type(p_err).__name__} - {p_err}")
             raise https_fn.HttpsError(
                 https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
-                f"Could not fetch payment details from Razorpay: {p_err}",
+                "Could not confirm the payment with Razorpay yet. Please wait a moment.",
             )
 
         stored_rzp_order_id = order.get("razorpay_order_id") or rzp_order_id
@@ -1391,7 +1392,7 @@ def delete_account(req: https_fn.CallableRequest) -> dict:
     pending_refunds = (
         db.collection("orders")
         .where("customer_id", "==", uid)
-        .where("refund_status", "==", "pending")
+        .where("refund_status", "in", ["pending", "retry_requested"])
         .get()
     )
 
@@ -1446,8 +1447,13 @@ def delete_account(req: https_fn.CallableRequest) -> dict:
         try:
             auth.delete_user(uid)
         except Exception as auth_err:
-            if "NOT_FOUND" not in str(auth_err) and "UserNotFoundError" not in type(auth_err).__name__:
-                print(f"[DELETE ACCOUNT] Auth delete notice: {auth_err}")
+            already_gone = (
+                "UserNotFoundError" in type(auth_err).__name__ or "NOT_FOUND" in str(auth_err)
+            )
+            if not already_gone:
+                # Do NOT report success: the login would still exist. Everything
+                # before this step is safe to repeat, so the app can simply retry.
+                raise
 
         return {"status": "success", "message": "Account successfully deleted."}
     except https_fn.HttpsError:
@@ -1471,6 +1477,79 @@ def _require_staff(db, uid: str) -> None:
         )
 
 
+# --- Order status rules (server-side, enforced in a transaction) ------------
+# The apps only ever offer the next step, but the server must not trust that:
+# a staff slip, an old app version or a replayed request must not be able to
+# make an unpaid order real, revive a finished one, or refund a delivered one.
+_STATUS_FLOW = {
+    "placed": {"preparing"},
+    "confirmed": {"preparing"},          # legacy value
+    "preparing": {"out_for_delivery"},
+    "out_for_delivery": {"delivered"},
+}
+_STAFF_CAN_CANCEL = {"placed", "confirmed", "preparing", "out_for_delivery"}
+_CUSTOMER_CAN_CANCEL = {"placed"}
+
+
+@firestore.transactional
+def _change_status_txn(transaction, order_ref, new_status, uid, is_staff, reason):
+    order = order_ref.get(transaction=transaction).to_dict()
+    if order is None:
+        raise https_fn.HttpsError(https_fn.FunctionsErrorCode.NOT_FOUND, "Order not found")
+    current = order.get("order_status")
+
+    if new_status == "cancelled":
+        allowed = _STAFF_CAN_CANCEL if is_staff else _CUSTOMER_CAN_CANCEL
+        if current not in allowed:
+            message = (
+                f"An order that is '{current}' cannot be cancelled."
+                if is_staff
+                else "Orders in progress cannot be cancelled by customer"
+            )
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.FAILED_PRECONDITION, message)
+    else:
+        if new_status not in _STATUS_FLOW.get(current, set()):
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                f"An order that is '{current}' cannot be moved to '{new_status}'.",
+            )
+        if order.get("payment_mode") == "upi" and order.get("payment_status") != "paid":
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                "This order has not been paid yet.",
+            )
+
+    update = {
+        "order_status": new_status,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "updated_by": uid,
+    }
+    log = {
+        "status": new_status,
+        "timestamp": firestore.SERVER_TIMESTAMP,
+        "changed_by": uid,
+    }
+    if new_status == "cancelled":
+        update["cancel_reason"] = reason
+        log["reason"] = reason
+    else:
+        update["status_changed_by"] = uid
+
+    transaction.update(order_ref, update)
+    transaction.set(order_ref.collection("status_log").document(), log)
+    return current
+
+
+def _internal_error(name: str, e: Exception):
+    ref_id = _generate_ref_id()
+    print(f"[INTERNAL ERROR] {name} ref={ref_id}: {type(e).__name__} - {e}")
+    traceback.print_exc()
+    return https_fn.HttpsError(
+        https_fn.FunctionsErrorCode.INTERNAL,
+        f"Something went wrong. Please try again. (ref {ref_id})",
+    )
+
+
 @https_fn.on_call(region=REGION)
 def update_order_status(req: https_fn.CallableRequest) -> dict:
     if req.auth is None:
@@ -1484,41 +1563,20 @@ def update_order_status(req: https_fn.CallableRequest) -> dict:
         order_id = str(data.get("order_id") or "").strip()
         new_status = str(data.get("order_status") or "").strip().lower()
 
-        valid_statuses = ["placed", "confirmed", "preparing", "out_for_delivery", "delivered", "cancelled"]
-        if not order_id or new_status not in valid_statuses:
-            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.INVALID_ARGUMENT, f"Invalid order_id or order_status: {new_status}")
+        if not order_id or new_status not in ("preparing", "out_for_delivery", "delivered", "cancelled"):
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+                f"Invalid order_id or order_status: {new_status}",
+            )
 
+        reason = str(data.get("reason") or "Order cancelled").strip()[:200]
         order_ref = db.collection("orders").document(order_id)
-        order_doc = order_ref.get()
-        if not order_doc.exists:
-            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.NOT_FOUND, "Order not found")
-
-        # Update ONLY allowed fields
-        order_ref.update({
-            "order_status": new_status,
-            "updated_at": firestore.SERVER_TIMESTAMP,
-            "updated_by": req.auth.uid,
-            "status_changed_by": req.auth.uid,
-        })
-
-        # Append to status_log subcollection
-        order_ref.collection("status_log").add({
-            "status": new_status,
-            "timestamp": firestore.SERVER_TIMESTAMP,
-            "changed_by": req.auth.uid,
-        })
-
+        _change_status_txn(db.transaction(), order_ref, new_status, req.auth.uid, True, reason)
         return {"order_id": order_id, "order_status": new_status}
     except https_fn.HttpsError:
         raise
     except Exception as e:
-        ref_id = _generate_ref_id()
-        print(f"[INTERNAL ERROR] update_order_status ref={ref_id}: {type(e).__name__} - {e}")
-        traceback.print_exc()
-        raise https_fn.HttpsError(
-            https_fn.FunctionsErrorCode.INTERNAL,
-            f"Something went wrong. Please try again. (ref {ref_id})",
-        )
+        raise _internal_error("update_order_status", e)
 
 
 @https_fn.on_call(region=REGION)
@@ -1530,8 +1588,9 @@ def mark_cod_collected(req: https_fn.CallableRequest) -> dict:
         db = firestore.client()
         _require_staff(db, req.auth.uid)
 
-        data = req.data or {}
-        order_id = str(data.get("order_id") or "").strip()
+        order_id = str((req.data or {}).get("order_id") or "").strip()
+        if not order_id:
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.INVALID_ARGUMENT, "order_id is required")
 
         order_ref = db.collection("orders").document(order_id)
         order_doc = order_ref.get()
@@ -1542,24 +1601,28 @@ def mark_cod_collected(req: https_fn.CallableRequest) -> dict:
         if order.get("payment_mode") != "cod":
             raise https_fn.HttpsError(https_fn.FunctionsErrorCode.FAILED_PRECONDITION, "Order is not a Cash on Delivery order")
 
-        # Update ONLY allowed fields
+        # Already collected (also the value older versions of this function wrote): nothing to do.
+        if order.get("payment_status") in ("cod_collected", "paid"):
+            return {"order_id": order_id, "payment_status": "cod_collected"}
+
+        if order.get("order_status") not in ("out_for_delivery", "delivered"):
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                "Cash can only be marked as collected once the order is out for delivery.",
+            )
+
+        # 'cod_collected' is the value both apps already understand.
         order_ref.update({
-            "payment_status": "paid",
+            "payment_status": "cod_collected",
+            "cod_collected_at": firestore.SERVER_TIMESTAMP,
             "updated_at": firestore.SERVER_TIMESTAMP,
             "updated_by": req.auth.uid,
         })
-
-        return {"order_id": order_id, "payment_status": "paid"}
+        return {"order_id": order_id, "payment_status": "cod_collected"}
     except https_fn.HttpsError:
         raise
     except Exception as e:
-        ref_id = _generate_ref_id()
-        print(f"[INTERNAL ERROR] mark_cod_collected ref={ref_id}: {type(e).__name__} - {e}")
-        traceback.print_exc()
-        raise https_fn.HttpsError(
-            https_fn.FunctionsErrorCode.INTERNAL,
-            f"Something went wrong. Please try again. (ref {ref_id})",
-        )
+        raise _internal_error("mark_cod_collected", e)
 
 
 @https_fn.on_call(region=REGION)
@@ -1572,6 +1635,8 @@ def cancel_order(req: https_fn.CallableRequest) -> dict:
         data = req.data or {}
         order_id = str(data.get("order_id") or "").strip()
         reason = str(data.get("reason") or "Order cancelled").strip()[:200]
+        if not order_id:
+            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.INVALID_ARGUMENT, "order_id is required")
 
         order_ref = db.collection("orders").document(order_id)
         order_doc = order_ref.get()
@@ -1581,39 +1646,17 @@ def cancel_order(req: https_fn.CallableRequest) -> dict:
         order = order_doc.to_dict() or {}
         is_staff = db.collection("staff").document(req.auth.uid).get().exists
         is_owner = order.get("customer_id") == req.auth.uid
-
         if not is_staff and not is_owner:
             raise https_fn.HttpsError(https_fn.FunctionsErrorCode.PERMISSION_DENIED, "Permission denied")
 
-        if not is_staff and order.get("order_status") != "placed":
-            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.FAILED_PRECONDITION, "Orders in progress cannot be cancelled by customer")
-
-        # Update ONLY allowed fields
-        order_ref.update({
-            "order_status": "cancelled",
-            "cancel_reason": reason,
-            "updated_at": firestore.SERVER_TIMESTAMP,
-            "updated_by": req.auth.uid,
-        })
-
-        order_ref.collection("status_log").add({
-            "status": "cancelled",
-            "reason": reason,
-            "timestamp": firestore.SERVER_TIMESTAMP,
-            "changed_by": req.auth.uid,
-        })
-
+        # Re-checks the current status inside the transaction, so a customer
+        # cancelling while the restaurant accepts cannot both "win".
+        _change_status_txn(db.transaction(), order_ref, "cancelled", req.auth.uid, is_staff, reason)
         return {"order_id": order_id, "order_status": "cancelled"}
     except https_fn.HttpsError:
         raise
     except Exception as e:
-        ref_id = _generate_ref_id()
-        print(f"[INTERNAL ERROR] cancel_order ref={ref_id}: {type(e).__name__} - {e}")
-        traceback.print_exc()
-        raise https_fn.HttpsError(
-            https_fn.FunctionsErrorCode.INTERNAL,
-            f"Something went wrong. Please try again. (ref {ref_id})",
-        )
+        raise _internal_error("cancel_order", e)
 
 
 @https_fn.on_call(region=REGION)
