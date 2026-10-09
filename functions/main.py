@@ -46,6 +46,7 @@ import hashlib
 import hmac
 import json
 import os
+import time
 import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -808,6 +809,42 @@ def _mark_paid_txn(transaction, order_ref, payment_id):
     return "needs_refund"
 
 
+def _settle_payment(client, payment_id, amount_paise):
+    """Fetch a payment and, if Razorpay only *authorized* it, capture it.
+
+    Returns the freshest payment dict. Callers must still check `status`:
+    "captured" means the money is ours; anything else means not yet.
+
+    Why this exists: with auto-capture off (or a slow bank), a payment is
+    `authorized` for a moment after the customer pays. Treating that as a
+    failure showed "Verification Failed" to people who had already paid.
+    A capture error here usually means auto-capture won the race, so we just
+    re-fetch and look at the real status."""
+    payment = {}
+    for attempt in range(3):
+        payment = client.payment.fetch(payment_id)
+        status = payment.get("status")
+
+        if status == "captured":
+            return payment
+
+        if status == "authorized":
+            try:
+                client.payment.capture(payment_id, amount_paise, {"currency": "INR"})
+            except Exception as cap_err:  # noqa: BLE001
+                print(f"[RAZORPAY] capture of {payment_id} did not go through: "
+                      f"{type(cap_err).__name__} - {cap_err}")
+            payment = client.payment.fetch(payment_id)
+            if payment.get("status") == "captured":
+                return payment
+        elif status in ("failed", "refunded"):
+            return payment
+
+        if attempt < 2:
+            time.sleep(1.0)
+    return payment
+
+
 def _find_order_by_razorpay_id(db, razorpay_order_id):
     if not razorpay_order_id:
         return None
@@ -870,6 +907,14 @@ def razorpay_create_order(req: https_fn.CallableRequest) -> dict:
             order_ref.update({
                 "razorpay_order_id": razorpay_order_id,
                 "razorpay_amount": amount_paise,
+                "payment_started_at": firestore.SERVER_TIMESTAMP,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            })
+        else:
+            # Customer is retrying: restart the payment window so the order
+            # is not expired while they are in the middle of paying.
+            order_ref.update({
+                "payment_started_at": firestore.SERVER_TIMESTAMP,
                 "updated_at": firestore.SERVER_TIMESTAMP,
             })
 
@@ -932,13 +977,17 @@ def razorpay_verify_payment(req: https_fn.CallableRequest) -> dict:
             raise https_fn.HttpsError(https_fn.FunctionsErrorCode.PERMISSION_DENIED,
                                       "Payment signature could not be verified")
 
+        stored_amount_paise = order.get("razorpay_amount")
+        if stored_amount_paise is None:
+            stored_amount_paise = int((Decimal(str(parse_float(order.get("total", 0)))) * 100).to_integral_value())
+
         client, key_id = _razorpay_client()
         try:
-            payment = client.payment.fetch(payment_id)
+            payment = _settle_payment(client, payment_id, stored_amount_paise)
         except Exception as p_err:
             print(f"[RAZORPAY] could not fetch payment {payment_id}: {type(p_err).__name__} - {p_err}")
             raise https_fn.HttpsError(
-                https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                https_fn.FunctionsErrorCode.UNAVAILABLE,
                 "Could not confirm the payment with Razorpay yet. Please wait a moment.",
             )
 
@@ -949,10 +998,6 @@ def razorpay_verify_payment(req: https_fn.CallableRequest) -> dict:
                 https_fn.FunctionsErrorCode.PERMISSION_DENIED,
                 "Payment does not belong to this Razorpay order",
             )
-
-        stored_amount_paise = order.get("razorpay_amount")
-        if stored_amount_paise is None:
-            stored_amount_paise = int((Decimal(str(parse_float(order.get("total", 0)))) * 100).to_integral_value())
 
         p_amount = parse_int(payment.get("amount"))
         if p_amount != stored_amount_paise:
@@ -967,11 +1012,17 @@ def razorpay_verify_payment(req: https_fn.CallableRequest) -> dict:
                 "Invalid payment currency",
             )
 
-        if payment.get("status") != "captured":
+        p_status = payment.get("status")
+        if p_status in ("failed", "refunded"):
             raise https_fn.HttpsError(
                 https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
-                f"Payment status is '{payment.get('status')}', not captured",
+                "This payment did not go through. Any amount deducted will be returned by your bank.",
             )
+        if p_status != "captured":
+            # Still settling (created / authorized). Not an error: the app keeps
+            # waiting, and the webhook will finish the job if the app is closed.
+            print(f"[RAZORPAY] payment {payment_id} is '{p_status}' - reporting pending")
+            return {"status": "pending"}
 
         status = _mark_paid_txn(db.transaction(), order_ref, payment_id)
         return {"status": status}
@@ -987,7 +1038,22 @@ def razorpay_verify_payment(req: https_fn.CallableRequest) -> dict:
         )
 
 
-@https_fn.on_request(region=REGION, secrets=[RAZORPAY_WEBHOOK_SECRET])
+@firestore.transactional
+def _mark_payment_failed_txn(transaction, order_ref):
+    """A failed attempt must never overwrite a paid / expired order (the
+    customer can retry on the same Razorpay order, and webhooks can arrive late)."""
+    order = order_ref.get(transaction=transaction).to_dict() or {}
+    if order.get("order_status") == "pending_payment" and order.get("payment_status") != "paid":
+        transaction.update(order_ref, {
+            "payment_status": "failed",
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+
+
+@https_fn.on_request(
+    region=REGION,
+    secrets=[RAZORPAY_WEBHOOK_SECRET, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET],
+)
 def razorpay_webhook(req: https_fn.Request) -> https_fn.Response:
     webhook_secret = _secret("RAZORPAY_WEBHOOK_SECRET")
     if not webhook_secret:
@@ -1023,29 +1089,34 @@ def razorpay_webhook(req: https_fn.Request) -> https_fn.Response:
         order_ref = _find_order_by_razorpay_id(db, rzp_order_id)
         if order_ref is None:
             print(f"[RAZORPAY WEBHOOK] {event_type}: no order for {rzp_order_id}")
-        elif event_type in ("payment.captured", "order.paid"):
+        elif event_type in ("payment.authorized", "payment.captured", "order.paid"):
             snap = order_ref.get().to_dict() or {}
             stored_amount_paise = snap.get("razorpay_amount")
             if stored_amount_paise is None:
                 stored_amount_paise = int((Decimal(str(parse_float(snap.get("total", 0)))) * 100).to_integral_value())
 
+            p_status = payment.get("status")
+            if p_status == "authorized" and payment_id:
+                # Auto-capture is off or slow: capture it ourselves.
+                client, _ = _razorpay_client()
+                payment = _settle_payment(client, payment_id, stored_amount_paise)
+                p_status = payment.get("status")
+
             p_amount = parse_int(payment.get("amount"))
             p_currency = payment.get("currency")
-            p_status = payment.get("status")
 
             if (p_currency == "INR" and
-                p_status in ("captured", "authorized") and
-                (p_amount == stored_amount_paise or p_amount == 0)):
+                p_status == "captured" and
+                p_amount == stored_amount_paise):
                 result = _mark_paid_txn(db.transaction(), order_ref, payment_id)
                 print(f"[RAZORPAY WEBHOOK] {event_type} {order_ref.id}: {result}")
             else:
-                print(f"[RAZORPAY WEBHOOK REJECTED] {event_type} {order_ref.id}: amount={p_amount} vs {stored_amount_paise}, status={p_status}")
+                print(f"[RAZORPAY WEBHOOK] {event_type} {order_ref.id}: not marked paid "
+                      f"(amount={p_amount} vs {stored_amount_paise}, status={p_status})")
         elif event_type == "payment.failed":
             # The customer may retry on the same Razorpay order, so the order
             # stays `pending_payment`; just record the failed attempt.
-            snap = order_ref.get().to_dict() or {}
-            if snap.get("payment_status") != "paid":
-                order_ref.update({"payment_status": "failed"})
+            _mark_payment_failed_txn(db.transaction(), order_ref)
     except Exception as e:  # noqa: BLE001 - answer 200 only when handled; 500 makes Razorpay retry
         import traceback
         traceback.print_exc()
@@ -1079,7 +1150,10 @@ def expire_unpaid_orders(event: scheduler_fn.ScheduledEvent) -> None:
     pending = db.collection("orders").where("order_status", "==", "pending_payment").get()
     expired = 0
     for doc in pending:
-        created = (doc.to_dict() or {}).get("created_at")
+        data = doc.to_dict() or {}
+        # Count from the latest payment attempt, so a customer who retries is
+        # not expired mid-payment.
+        created = data.get("payment_started_at") or data.get("created_at")
         if created is not None and created < cutoff:
             if _expire_txn(db.transaction(), doc.reference):
                 expired += 1
@@ -1550,7 +1624,9 @@ def _internal_error(name: str, e: Exception):
     )
 
 
-@https_fn.on_call(region=REGION)
+# min_instances=1: the admin taps these while a customer is waiting, and a cold
+# Python instance (loads Firebase Admin + Razorpay SDK) added 3-5 seconds.
+@https_fn.on_call(region=REGION, min_instances=1)
 def update_order_status(req: https_fn.CallableRequest) -> dict:
     if req.auth is None:
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
@@ -1625,7 +1701,7 @@ def mark_cod_collected(req: https_fn.CallableRequest) -> dict:
         raise _internal_error("mark_cod_collected", e)
 
 
-@https_fn.on_call(region=REGION)
+@https_fn.on_call(region=REGION, min_instances=1)
 def cancel_order(req: https_fn.CallableRequest) -> dict:
     if req.auth is None:
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
