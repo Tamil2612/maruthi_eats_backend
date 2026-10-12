@@ -182,6 +182,7 @@ def validate_coupon(
     item_total: float | Decimal,
     user_id: str | None = None,
     check_usage_limits: bool = True,
+    transaction=None,
 ) -> tuple[Decimal, str | None]:
     """
     Re-checks a coupon:
@@ -192,11 +193,16 @@ def validate_coupon(
     The audit that runs AFTER an order was placed must pass
     `check_usage_limits=False`: by then the order has already consumed its own use,
     so re-checking the limits would flag the very order that took the last one.
+    When `transaction` is provided, reads execute within the transaction.
     """
     if not coupon_code:
         return Decimal('0'), None
 
-    matches = db.collection("coupons").where("code", "==", coupon_code).limit(1).get()
+    if transaction:
+        matches = db.collection("coupons").where("code", "==", coupon_code).limit(1).get(transaction=transaction)
+    else:
+        matches = db.collection("coupons").where("code", "==", coupon_code).limit(1).get()
+
     if not matches:
         return Decimal('0'), f"Coupon '{coupon_code}' does not exist"
 
@@ -221,38 +227,66 @@ def validate_coupon(
     # 1. First order only restriction
     if bool(coupon.get("is_first_order_only")):
         if user_id:
-            orders = (
-                db.collection("orders")
-                .where("customer_id", "==", user_id)
-                .get()
-            )
+            first_order_ref = db.collection("user_first_orders").document(user_id)
+            first_order_snap = first_order_ref.get(transaction=transaction) if transaction else first_order_ref.get()
+            if first_order_snap.exists and first_order_snap.to_dict().get("has_first_order"):
+                return Decimal('0'), f"Coupon '{coupon_code}' is valid for your first order only."
+
+            if transaction:
+                orders = db.collection("orders").where("customer_id", "==", user_id).get(transaction=transaction)
+                redemptions = db.collection("coupon_redemptions").where("user_id", "==", user_id).get(transaction=transaction)
+            else:
+                orders = db.collection("orders").where("customer_id", "==", user_id).get()
+                redemptions = db.collection("coupon_redemptions").where("user_id", "==", user_id).get()
+
             qualifying_count = 0
             for doc in orders:
                 od = doc.to_dict() or {}
                 if od.get("order_status") in ["placed", "confirmed", "preparing", "out_for_delivery", "delivered"]:
                     qualifying_count += 1
-                    break  # one is enough
+                    break
+
+            if qualifying_count == 0:
+                for doc in redemptions:
+                    rd = doc.to_dict() or {}
+                    if rd.get("status") in ["reserved", "completed"]:
+                        qualifying_count += 1
+                        break
+
             if qualifying_count > 0:
                 return Decimal('0'), f"Coupon '{coupon_code}' is valid for your first order only."
 
-    # A limit that is not a usable number (typo in the admin form) means "no limit"
-    # instead of crashing every order that uses the coupon.
     max_uses_per_user = parse_int(coupon.get("max_uses_per_user"), default=0)
     max_global_uses = parse_int(coupon.get("max_global_uses"), default=0)
 
     # 2. Per-user usage limit restriction
     if max_uses_per_user > 0 and user_id:
-        redemptions = (
-            db.collection("coupon_redemptions")
-            .where("coupon_id", "==", coupon_id)
-            .where("user_id", "==", user_id)
-            .get()
-        )
+        user_limit_ref = db.collection("coupon_user_limits").document(f"{coupon_id}_{user_id}")
+        user_limit_snap = user_limit_ref.get(transaction=transaction) if transaction else user_limit_ref.get()
+
         used_count = 0
-        for doc in redemptions:
-            rd = doc.to_dict() or {}
-            if rd.get("status") in ["reserved", "completed"]:
-                used_count += 1
+        if user_limit_snap.exists:
+            used_count = parse_int(user_limit_snap.to_dict().get("used_count"), default=0)
+        else:
+            if transaction:
+                redemptions = (
+                    db.collection("coupon_redemptions")
+                    .where("coupon_id", "==", coupon_id)
+                    .where("user_id", "==", user_id)
+                    .get(transaction=transaction)
+                )
+            else:
+                redemptions = (
+                    db.collection("coupon_redemptions")
+                    .where("coupon_id", "==", coupon_id)
+                    .where("user_id", "==", user_id)
+                    .get()
+                )
+            for doc in redemptions:
+                rd = doc.to_dict() or {}
+                if rd.get("status") in ["reserved", "completed"]:
+                    used_count += 1
+
         if used_count >= max_uses_per_user:
             if max_uses_per_user == 1:
                 return Decimal('0'), f"You have already used coupon '{coupon_code}'."

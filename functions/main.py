@@ -49,6 +49,11 @@ import os
 import time
 import traceback
 import uuid
+
+
+def _generate_ref_id() -> str:
+    return uuid.uuid4().hex[:8].upper()
+import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -259,14 +264,26 @@ def _create_order_and_reserve_coupon_txn(
     user_id,
     payment_mode,
 ):
+    # READ 1: order_ref check
+    snap = order_ref.get(transaction=transaction)
+    if snap.exists:
+        existing = snap.to_dict() or {}
+        return existing.get("total", 0.0)
+
     discount_val = 0.0
     c_id = None
     c_data = {}
+    c_ref = None
 
     if coupon_code:
-        # All reads must occur before any writes inside a transaction
+        # READ 2: validate_coupon (reads coupons, coupon_user_limits, user_first_orders)
         discount_dec, coupon_error = validate_coupon(
-            db, coupon_code, item_total_dec, user_id=user_id, transaction=transaction
+            db,
+            coupon_code,
+            item_total_dec,
+            user_id=user_id,
+            check_usage_limits=True,
+            transaction=transaction,
         )
         if coupon_error:
             raise https_fn.HttpsError(
@@ -279,6 +296,13 @@ def _create_order_and_reserve_coupon_txn(
         if coupon_match:
             c_id = coupon_match[0].id
             c_data = coupon_match[0].to_dict() or {}
+            c_ref = coupon_match[0].reference
+
+    user_limit_ref = db.collection("coupon_user_limits").document(f"{c_id}_{user_id}") if (c_id and user_id) else None
+    user_limit_snap = user_limit_ref.get(transaction=transaction) if user_limit_ref else None
+
+    first_order_ref = db.collection("user_first_orders").document(user_id) if user_id else None
+    first_order_snap = first_order_ref.get(transaction=transaction) if first_order_ref else None
 
     food_subtotal = float(item_total_dec)
     delivery_fee = order_data["delivery_fee"]
@@ -287,10 +311,17 @@ def _create_order_and_reserve_coupon_txn(
     order_data["coupon_discount"] = discount_val
     order_data["total"] = total_val
 
-    # All writes in the transaction
+    # ALL WRITES START HERE (no reads after this point!)
     transaction.set(order_ref, order_data)
 
-    if coupon_code and discount_val > 0 and c_id:
+    if first_order_ref:
+        transaction.set(first_order_ref, {
+            "has_first_order": True,
+            "order_id": order_ref.id,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+
+    if coupon_code and discount_val > 0 and c_id and c_ref:
         redemption_ref = db.collection("coupon_redemptions").document(f"{c_id}_{order_ref.id}")
         redemption_status = "completed" if payment_mode == "cod" else "reserved"
         transaction.set(redemption_ref, {
@@ -302,9 +333,20 @@ def _create_order_and_reserve_coupon_txn(
             "created_at": firestore.SERVER_TIMESTAMP,
             "updated_at": firestore.SERVER_TIMESTAMP,
         })
-        if c_data.get("max_global_uses"):
-            transaction.update(db.collection("coupons").document(c_id), {
-                "current_global_uses": firestore.Increment(1),
+
+        if user_limit_ref:
+            current_used = parse_int(user_limit_snap.to_dict().get("used_count"), default=0) if (user_limit_snap and user_limit_snap.exists) else 0
+            transaction.set(user_limit_ref, {
+                "used_count": current_used + 1,
+                "coupon_id": c_id,
+                "user_id": user_id,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            })
+
+        if c_data.get("max_global_uses") is not None or "current_global_uses" in c_data:
+            current_uses = parse_int(c_data.get("current_global_uses"), default=0)
+            transaction.update(c_ref, {
+                "current_global_uses": current_uses + 1,
             })
 
     return total_val
@@ -318,6 +360,22 @@ def place_order(req: https_fn.CallableRequest) -> dict:
     try:
         db = firestore.client()
         data = req.data or {}
+
+        # Idempotency check: if an order with this idempotency_key was already created, return it
+        idempotency_key = data.get("idempotency_key") or data.get("client_order_id")
+        if idempotency_key:
+            idempotency_key = str(idempotency_key).strip()[:100]
+            idem_ref = db.collection("orders").document(f"idem_{req.auth.uid}_{idempotency_key}")
+            idem_snap = idem_ref.get()
+            if idem_snap.exists:
+                existing = idem_snap.to_dict() or {}
+                return {
+                    "order_id": idem_ref.id,
+                    "total": existing.get("total", 0.0),
+                    "delivery_fee": existing.get("delivery_fee", 0.0),
+                    "distance_km": existing.get("delivery_distance_km", 0.0),
+                }
+
         items = data.get("items", [])
         coupon_code = data.get("coupon_code")
         if coupon_code is not None:
@@ -623,21 +681,18 @@ def place_order(req: https_fn.CallableRequest) -> dict:
                 min_msg,
             )
 
-        # 7. Validate Coupon
-        discount_dec, coupon_error = validate_coupon(db, coupon_code, item_total_dec, user_id=req.auth.uid)
-        if coupon_error:
-            raise https_fn.HttpsError(https_fn.FunctionsErrorCode.FAILED_PRECONDITION, coupon_error)
-
-        discount_val = float(discount_dec)
-
-        # 8. Calculate Authoritative Delivery Fee based on distance slabs
+        # 7. Calculate Authoritative Delivery Fee based on distance slabs
         delivery_fee = calculate_delivery_fee(delivery_settings, distance_km)
 
-        # 9. Calculate Final Total
-        total_val = round(max(0.0, food_subtotal - discount_val + delivery_fee), 2)
+        # 8. Check for optional idempotency key in request payload
+        idempotency_key = data.get("idempotency_key") or data.get("client_order_id")
+        if idempotency_key:
+            idempotency_key = str(idempotency_key).strip()[:100]
+            order_ref = db.collection("orders").document(f"idem_{req.auth.uid}_{idempotency_key}")
+        else:
+            order_ref = db.collection("orders").document()
 
-        order_ref = db.collection("orders").document()
-        order_ref.set({
+        order_data = {
             "customer_id": req.auth.uid,
             "items": priced_items,
             "item_total": food_subtotal,
@@ -646,8 +701,8 @@ def place_order(req: https_fn.CallableRequest) -> dict:
             "minimum_order_value_at_order": parse_float(settings.get("minimum_order_value"), default=150.0),
             "restaurant_timezone": str(settings.get("timezone", "Asia/Kolkata")),
             "coupon_code": coupon_code,
-            "coupon_discount": discount_val,
-            "total": total_val,
+            "coupon_discount": 0.0,
+            "total": 0.0,
             "payment_mode": payment_mode,
             "payment_status": "pending" if payment_mode == "upi" else "cod_pending",
             "order_status": "pending_payment" if payment_mode == "upi" else "placed",
@@ -657,28 +712,19 @@ def place_order(req: https_fn.CallableRequest) -> dict:
             "longitude": lng,
             "validation_status": "ok",
             "created_at": firestore.SERVER_TIMESTAMP,
-        })
+        }
 
-        # Record coupon redemption / reservation atomically
-        if coupon_code and discount_val > 0:
-            coupon_match = db.collection("coupons").where("code", "==", coupon_code).limit(1).get()
-            if coupon_match:
-                c_id = coupon_match[0].id
-                c_data = coupon_match[0].to_dict() or {}
-                redemption_status = "completed" if payment_mode == "cod" else "reserved"
-                db.collection("coupon_redemptions").document(f"{c_id}_{order_ref.id}").set({
-                    "coupon_id": c_id,
-                    "coupon_code": coupon_code,
-                    "user_id": req.auth.uid,
-                    "order_id": order_ref.id,
-                    "status": redemption_status,
-                    "created_at": firestore.SERVER_TIMESTAMP,
-                    "updated_at": firestore.SERVER_TIMESTAMP,
-                })
-                if c_data.get("max_global_uses"):
-                    db.collection("coupons").document(c_id).update({
-                        "current_global_uses": firestore.Increment(1),
-                    })
+        # Atomically validate coupon, reserve usage, and create order inside a single transaction
+        total_val = _create_order_and_reserve_coupon_txn(
+            db.transaction(),
+            db,
+            order_ref,
+            order_data,
+            coupon_code,
+            item_total_dec,
+            req.auth.uid,
+            payment_mode,
+        )
 
         return {"order_id": order_ref.id, "total": total_val, "delivery_fee": delivery_fee, "distance_km": distance_km}
     except https_fn.HttpsError:
@@ -897,10 +943,14 @@ def _razorpay_client():
 def _complete_coupon_redemption_txn(db, transaction, order_ref, order):
     coupon_code = order.get("coupon_code")
     if not coupon_code:
-        return
-    matches = db.collection("coupons").where("code", "==", coupon_code).limit(1).get()
+        return None, None
+    matches = (
+        db.collection("coupons").where("code", "==", coupon_code).limit(1).get(transaction=transaction)
+        if transaction
+        else db.collection("coupons").where("code", "==", coupon_code).limit(1).get()
+    )
     if not matches:
-        return
+        return None, None
     c_id = matches[0].id
     redemption_ref = db.collection("coupon_redemptions").document(f"{c_id}_{order_ref.id}")
     redemption_snap = redemption_ref.get(transaction=transaction) if transaction else redemption_ref.get()
@@ -912,24 +962,44 @@ def _complete_coupon_redemption_txn(db, transaction, order_ref, order):
                 "completed_at": firestore.SERVER_TIMESTAMP,
                 "updated_at": firestore.SERVER_TIMESTAMP,
             }
-            if transaction:
-                transaction.update(redemption_ref, update_data)
-            else:
-                redemption_ref.update(update_data)
+            return redemption_ref, update_data
+    return None, None
 
 
 def _release_coupon_redemption_txn(db, transaction, order_ref, order):
     coupon_code = order.get("coupon_code")
+    user_id = order.get("customer_id")
     if not coupon_code:
         return
-    matches = db.collection("coupons").where("code", "==", coupon_code).limit(1).get()
+
+    matches = (
+        db.collection("coupons").where("code", "==", coupon_code).limit(1).get(transaction=transaction)
+        if transaction
+        else db.collection("coupons").where("code", "==", coupon_code).limit(1).get()
+    )
     if not matches:
         return
+
     c_id = matches[0].id
     c_data = matches[0].to_dict() or {}
+    c_ref = matches[0].reference
+
     redemption_ref = db.collection("coupon_redemptions").document(f"{c_id}_{order_ref.id}")
     redemption_snap = redemption_ref.get(transaction=transaction) if transaction else redemption_ref.get()
-    if redemption_snap.exists:
+
+    user_limit_ref = db.collection("coupon_user_limits").document(f"{c_id}_{user_id}") if (c_id and user_id) else None
+    user_limit_snap = (
+        user_limit_ref.get(transaction=transaction) if (user_limit_ref and transaction)
+        else (user_limit_ref.get() if user_limit_ref else None)
+    )
+
+    first_order_ref = db.collection("user_first_orders").document(user_id) if (user_id and bool(c_data.get("is_first_order_only"))) else None
+    first_order_snap = (
+        first_order_ref.get(transaction=transaction) if (first_order_ref and transaction)
+        else (first_order_ref.get() if first_order_ref else None)
+    )
+
+    if redemption_snap and redemption_snap.exists:
         rd = redemption_snap.to_dict() or {}
         if rd.get("status") in ["reserved", "completed"]:
             update_data = {
@@ -942,12 +1012,24 @@ def _release_coupon_redemption_txn(db, transaction, order_ref, order):
             else:
                 redemption_ref.update(update_data)
 
-            if c_data.get("max_global_uses"):
-                coupon_ref = matches[0].reference
+            if c_data.get("max_global_uses") is not None or "current_global_uses" in c_data:
                 if transaction:
-                    transaction.update(coupon_ref, {"current_global_uses": firestore.Increment(-1)})
+                    transaction.update(c_ref, {"current_global_uses": firestore.Increment(-1)})
                 else:
-                    coupon_ref.update({"current_global_uses": firestore.Increment(-1)})
+                    c_ref.update({"current_global_uses": firestore.Increment(-1)})
+
+            if user_limit_snap and user_limit_snap.exists:
+                current_used = max(0, parse_int(user_limit_snap.to_dict().get("used_count"), default=1) - 1)
+                if transaction:
+                    transaction.update(user_limit_ref, {"used_count": current_used, "updated_at": firestore.SERVER_TIMESTAMP})
+                else:
+                    user_limit_ref.update({"used_count": current_used, "updated_at": firestore.SERVER_TIMESTAMP})
+
+            if first_order_snap and first_order_snap.exists:
+                if transaction:
+                    transaction.delete(first_order_ref)
+                else:
+                    first_order_ref.delete()
 
 
 @firestore.transactional
@@ -961,6 +1043,8 @@ def _mark_paid_txn(transaction, order_ref, payment_id):
 
     db = firestore.client()
     if order.get("order_status") == "pending_payment":
+        red_ref, red_update = _complete_coupon_redemption_txn(db, transaction, order_ref, order)
+
         transaction.update(order_ref, {
             "payment_status": "paid",
             "order_status": "placed",
@@ -968,11 +1052,10 @@ def _mark_paid_txn(transaction, order_ref, payment_id):
             "paid_at": firestore.SERVER_TIMESTAMP,
             "updated_at": firestore.SERVER_TIMESTAMP,
         })
-        _complete_coupon_redemption_txn(db, transaction, order_ref, order)
+        if red_ref and red_update:
+            transaction.update(red_ref, red_update)
         return "paid"
 
-    # Money arrived for an order that already expired/was cancelled: keep the
-    # record so it can be refunded from the Razorpay dashboard.
     transaction.update(order_ref, {
         "payment_status": "paid_needs_refund",
         "razorpay_payment_id": payment_id,

@@ -37,7 +37,7 @@ class FakeRef:
     def __init__(self, db, coll, id):
         self.db, self.coll, self.id = db, coll, id
 
-    def get(self):
+    def get(self, transaction=None):
         return FakeDoc(self.id, self.db.data.get(self.coll, {}).get(self.id))
 
     def set(self, data):
@@ -45,7 +45,11 @@ class FakeRef:
 
     def update(self, changes):
         doc = self.db.data.setdefault(self.coll, {}).get(self.id, {})
-        doc.update(changes)
+        for k, v in changes.items():
+            if type(v).__name__ in ('Increment', 'NumericIncrement') or hasattr(v, 'value'):
+                doc[k] = doc.get(k, 0) + getattr(v, 'value', 0)
+            else:
+                doc[k] = v
         self.db.data[self.coll][self.id] = doc
 
 
@@ -68,7 +72,7 @@ class FakeQuery:
     def order_by(self, field, direction=None):
         return self
 
-    def get(self):
+    def get(self, transaction=None):
         return self.docs
 
 
@@ -84,7 +88,21 @@ class FakeCol:
 
     def where(self, field, op, value):
         rows = self.db.data.get(self.name, {})
-        return FakeQuery([FakeDoc(i, d) for i, d in rows.items() if d.get(field) == value])
+        return FakeQuery([FakeDoc(i, d) for i, d in rows.items() if (d or {}).get(field) == value])
+
+
+class FakeTransaction:
+    def __init__(self):
+        self._read_only = False
+
+    def get(self, ref_or_query):
+        return ref_or_query.get(transaction=self)
+
+    def update(self, ref, data):
+        ref.update(data)
+
+    def set(self, ref, data):
+        ref.set(data)
 
 
 class FakeDB:
@@ -98,6 +116,7 @@ class FakeDB:
             "offers": {},
             "coupons": {},
             "orders": {},
+            "coupon_redemptions": {},
             "settings": {
                 "restaurant": {
                     "is_open": True,
@@ -134,6 +153,9 @@ class FakeDB:
 
     def collection(self, name):
         return FakeCol(self, name)
+
+    def transaction(self):
+        return FakeTransaction()
 
 
 class RestaurantBusinessRulesTests(unittest.TestCase):

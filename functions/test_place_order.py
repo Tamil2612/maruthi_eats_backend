@@ -21,7 +21,7 @@ class FakeRef:
     def __init__(self, db, coll, id):
         self.db, self.coll, self.id = db, coll, id
 
-    def get(self):
+    def get(self, transaction=None):
         return FakeDoc(self.id, self.db.data.get(self.coll, {}).get(self.id))
 
     def set(self, data):
@@ -47,7 +47,7 @@ class FakeQuery:
     def order_by(self, field, direction=None):
         return self
 
-    def get(self):
+    def get(self, transaction=None):
         return self.docs
 
 
@@ -63,7 +63,21 @@ class FakeCol:
 
     def where(self, field, op, value):
         rows = self.db.data.get(self.name, {})
-        return FakeQuery([FakeDoc(i, d) for i, d in rows.items() if d.get(field) == value])
+        return FakeQuery([FakeDoc(i, d) for i, d in rows.items() if (d or {}).get(field) == value])
+
+
+class FakeTransaction:
+    def __init__(self):
+        self._read_only = False
+
+    def get(self, ref_or_query):
+        return ref_or_query.get(transaction=self)
+
+    def update(self, ref, data):
+        ref.update(data)
+
+    def set(self, ref, data):
+        ref.set(data)
 
 
 class FakeDB:
@@ -88,6 +102,7 @@ class FakeDB:
             "coupons": {"c1": {"code": "SAVE20", "amount": 20, "min_order_value": 100, "is_active": True,
                                "expiry_date": future}},
             "orders": {},
+            "coupon_redemptions": {},
             "settings": {
                 "restaurant": {
                     "is_open": True,
@@ -105,6 +120,9 @@ class FakeDB:
 
     def collection(self, name):
         return FakeCol(self, name)
+
+    def transaction(self):
+        return FakeTransaction()
 
 
 def line(item_id, qty=1, price=1, **kw):

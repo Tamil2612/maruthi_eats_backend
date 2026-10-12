@@ -10,14 +10,27 @@ from order_validation import validate_coupon
 
 
 class FakeDoc:
-    def __init__(self, id, data):
+    def __init__(self, id, data, db=None, coll=None):
         self.id = id
         self._d = data
         self.exists = data is not None
+        self.db = db
+        self.coll = coll
         self.reference = self
 
     def to_dict(self):
         return dict(self._d) if self._d is not None else None
+
+    def update(self, data):
+        if self.db and self.coll:
+            doc = self.db.data.setdefault(self.coll, {}).setdefault(self.id, {})
+            for k, v in data.items():
+                if type(v).__name__ in ('Increment', 'NumericIncrement') or hasattr(v, 'value'):
+                    val = getattr(v, 'value', 0)
+                    doc[k] = doc.get(k, 0) + val
+                else:
+                    doc[k] = v
+            self._d = doc
 
 
 class FakeRef:
@@ -27,7 +40,7 @@ class FakeRef:
         self.id = id
 
     def get(self, transaction=None):
-        return FakeDoc(self.id, self.db.data.get(self.coll, {}).get(self.id))
+        return FakeDoc(self.id, self.db.data.get(self.coll, {}).get(self.id), db=self.db, coll=self.coll)
 
     def set(self, data):
         self.db.data.setdefault(self.coll, {})[self.id] = data
@@ -35,10 +48,14 @@ class FakeRef:
     def update(self, data):
         doc = self.db.data.setdefault(self.coll, {}).setdefault(self.id, {})
         for k, v in data.items():
-            if hasattr(v, '__class__') and v.__class__.__name__ == 'NumericIncrement':
-                doc[k] = doc.get(k, 0) + v.value
+            if type(v).__name__ in ('Increment', 'NumericIncrement') or hasattr(v, 'value'):
+                val = getattr(v, 'value', 0)
+                doc[k] = doc.get(k, 0) + val
             else:
                 doc[k] = v
+
+    def collection(self, name):
+        return FakeCol(self.db, f"{self.coll}/{self.id}/{name}")
 
 
 class FakeQuery:
@@ -60,7 +77,7 @@ class FakeQuery:
     def order_by(self, field, direction=None):
         return self
 
-    def get(self):
+    def get(self, transaction=None):
         return self.docs
 
 
@@ -77,12 +94,15 @@ class FakeCol:
 
     def where(self, field, op, value):
         rows = self.db.data.get(self.name, {})
-        return FakeQuery([FakeDoc(i, d) for i, d in rows.items() if (d or {}).get(field) == value])
+        return FakeQuery([FakeDoc(i, d, db=self.db, coll=self.name) for i, d in rows.items() if (d or {}).get(field) == value])
 
 
 class FakeTransaction:
-    def get(self, ref):
-        return ref.get()
+    def __init__(self):
+        self._read_only = False
+
+    def get(self, ref_or_query):
+        return ref_or_query.get(transaction=self)
 
     def update(self, ref, data):
         ref.update(data)
