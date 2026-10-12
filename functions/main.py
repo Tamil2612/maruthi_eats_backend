@@ -54,7 +54,6 @@ from decimal import Decimal
 
 from firebase_admin import initialize_app, firestore, messaging, auth
 from firebase_functions import firestore_fn, https_fn, scheduler_fn, options, params
-import razorpay
 
 from order_validation import (
     DELIVERY_FEE,
@@ -98,14 +97,14 @@ PAYMENT_WINDOW_MINUTES = 30
 
 REGION = "asia-south1"  # Mumbai — closest region to an Indian user base
 
-# Latency settings for every function a customer or the restaurant staff WAITS on.
-# A Python function that has been idle needs 3-5 s to start ("cold start"), and
-# paying involves several calls in a row (preview -> place order -> Razorpay order
-# -> verify), so the delays added up to 10+ seconds. One warm instance with a bigger
-# slice of CPU removes that. Cost: roughly Rs. 250/month per warm function.
-# Set HOT_MIN_INSTANCES = 0 to switch the warm instances off again.
+# Cost-free latency settings. No instance is kept warm (that costs money every
+# month), so the first call after a quiet period can take a few seconds while the
+# function starts. The apps show a loader for that. 512 MB only costs extra while a
+# function is actually running, and gives it more CPU so it starts and answers faster.
+# To remove cold starts completely (about Rs. 250/month per function), set these to 1.
 HOT_MIN_INSTANCES = 0
 HOT_MEMORY = options.MemoryOption.MB_512
+ADMIN_MIN_INSTANCES = 0
 
 
 def _notify_admin(order_id: str, order: dict) -> None:
@@ -191,7 +190,11 @@ def on_order_created(event: firestore_fn.Event) -> None:
             f"recomputed {recomputed_item_total}"
         )
 
-    discount, coupon_error = validate_coupon(db, order.get("coupon_code"), recomputed_item_total)
+    # The order has already used up its own coupon use, so the usage limits must not
+    # be re-checked here (that would flag the order that took the very last use).
+    discount, coupon_error = validate_coupon(
+        db, order.get("coupon_code"), recomputed_item_total, check_usage_limits=False
+    )
     submitted_discount = Decimal(str(order.get("coupon_discount") or 0))
     if coupon_error:
         problems.append(coupon_error)
@@ -245,6 +248,68 @@ def on_order_created(event: firestore_fn.Event) -> None:
 # =======================================================================
 # 2. Secure order placement (optional — replaces the client's direct write)
 # =======================================================================
+@firestore.transactional
+def _create_order_and_reserve_coupon_txn(
+    transaction,
+    db,
+    order_ref,
+    order_data,
+    coupon_code,
+    item_total_dec,
+    user_id,
+    payment_mode,
+):
+    discount_val = 0.0
+    c_id = None
+    c_data = {}
+
+    if coupon_code:
+        # All reads must occur before any writes inside a transaction
+        discount_dec, coupon_error = validate_coupon(
+            db, coupon_code, item_total_dec, user_id=user_id, transaction=transaction
+        )
+        if coupon_error:
+            raise https_fn.HttpsError(
+                https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+                coupon_error,
+            )
+        discount_val = float(discount_dec)
+
+        coupon_match = db.collection("coupons").where("code", "==", coupon_code).limit(1).get(transaction=transaction)
+        if coupon_match:
+            c_id = coupon_match[0].id
+            c_data = coupon_match[0].to_dict() or {}
+
+    food_subtotal = float(item_total_dec)
+    delivery_fee = order_data["delivery_fee"]
+    total_val = round(max(0.0, food_subtotal - discount_val + delivery_fee), 2)
+
+    order_data["coupon_discount"] = discount_val
+    order_data["total"] = total_val
+
+    # All writes in the transaction
+    transaction.set(order_ref, order_data)
+
+    if coupon_code and discount_val > 0 and c_id:
+        redemption_ref = db.collection("coupon_redemptions").document(f"{c_id}_{order_ref.id}")
+        redemption_status = "completed" if payment_mode == "cod" else "reserved"
+        transaction.set(redemption_ref, {
+            "coupon_id": c_id,
+            "coupon_code": coupon_code,
+            "user_id": user_id,
+            "order_id": order_ref.id,
+            "status": redemption_status,
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+        if c_data.get("max_global_uses"):
+            transaction.update(db.collection("coupons").document(c_id), {
+                "current_global_uses": firestore.Increment(1),
+            })
+
+    return total_val
+
+
 @https_fn.on_call(region=REGION, enforce_app_check=True, memory=HOT_MEMORY, min_instances=HOT_MIN_INSTANCES)
 def place_order(req: https_fn.CallableRequest) -> dict:
     if req.auth is None:
@@ -824,6 +889,8 @@ def _razorpay_client():
             https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
             "Online payment is not set up on the server yet.",
         )
+    import razorpay  # imported here so functions that never pay start faster
+
     return razorpay.Client(auth=(key_id, key_secret)), key_id
 
 
@@ -1803,7 +1870,7 @@ def _internal_error(name: str, e: Exception):
 
 # min_instances=1: the admin taps these while a customer is waiting, and a cold
 # Python instance (loads Firebase Admin + Razorpay SDK) added 3-5 seconds.
-@https_fn.on_call(region=REGION, memory=HOT_MEMORY, min_instances=HOT_MIN_INSTANCES)
+@https_fn.on_call(region=REGION, memory=HOT_MEMORY, min_instances=ADMIN_MIN_INSTANCES)
 def update_order_status(req: https_fn.CallableRequest) -> dict:
     if req.auth is None:
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
@@ -1878,7 +1945,7 @@ def mark_cod_collected(req: https_fn.CallableRequest) -> dict:
         raise _internal_error("mark_cod_collected", e)
 
 
-@https_fn.on_call(region=REGION, memory=HOT_MEMORY, min_instances=HOT_MIN_INSTANCES)
+@https_fn.on_call(region=REGION, memory=HOT_MEMORY, min_instances=ADMIN_MIN_INSTANCES)
 def cancel_order(req: https_fn.CallableRequest) -> dict:
     if req.auth is None:
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")

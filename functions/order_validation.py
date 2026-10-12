@@ -181,11 +181,17 @@ def validate_coupon(
     coupon_code: str | None,
     item_total: float | Decimal,
     user_id: str | None = None,
+    check_usage_limits: bool = True,
 ) -> tuple[Decimal, str | None]:
     """
     Re-checks a coupon:
     must exist, be active, not expired, meet minimum order value,
-    and fulfill first-order-only, per-user, and global usage limits.
+    and (when `check_usage_limits` is True) fulfill the first-order-only,
+    per-user and global usage limits.
+
+    The audit that runs AFTER an order was placed must pass
+    `check_usage_limits=False`: by then the order has already consumed its own use,
+    so re-checking the limits would flag the very order that took the last one.
     """
     if not coupon_code:
         return Decimal('0'), None
@@ -209,6 +215,9 @@ def validate_coupon(
     if item_total_decimal < min_order:
         return Decimal('0'), f"Coupon '{coupon_code}' requires a minimum order of ₹{min_order}, cart total is ₹{item_total_decimal}"
 
+    if not check_usage_limits:
+        return Decimal(str(coupon.get("amount") or 0)), None
+
     # 1. First order only restriction
     if bool(coupon.get("is_first_order_only")):
         if user_id:
@@ -222,34 +231,37 @@ def validate_coupon(
                 od = doc.to_dict() or {}
                 if od.get("order_status") in ["placed", "confirmed", "preparing", "out_for_delivery", "delivered"]:
                     qualifying_count += 1
+                    break  # one is enough
             if qualifying_count > 0:
                 return Decimal('0'), f"Coupon '{coupon_code}' is valid for your first order only."
 
+    # A limit that is not a usable number (typo in the admin form) means "no limit"
+    # instead of crashing every order that uses the coupon.
+    max_uses_per_user = parse_int(coupon.get("max_uses_per_user"), default=0)
+    max_global_uses = parse_int(coupon.get("max_global_uses"), default=0)
+
     # 2. Per-user usage limit restriction
-    max_uses_per_user = coupon.get("max_uses_per_user")
-    if max_uses_per_user is not None and int(max_uses_per_user) > 0:
-        if user_id:
-            redemptions = (
-                db.collection("coupon_redemptions")
-                .where("coupon_id", "==", coupon_id)
-                .where("user_id", "==", user_id)
-                .get()
-            )
-            used_count = 0
-            for doc in redemptions:
-                rd = doc.to_dict() or {}
-                if rd.get("status") in ["reserved", "completed"]:
-                    used_count += 1
-            if used_count >= int(max_uses_per_user):
-                if int(max_uses_per_user) == 1:
-                    return Decimal('0'), f"You have already used coupon '{coupon_code}'."
-                return Decimal('0'), f"You have reached the maximum usage limit ({max_uses_per_user}) for coupon '{coupon_code}'."
+    if max_uses_per_user > 0 and user_id:
+        redemptions = (
+            db.collection("coupon_redemptions")
+            .where("coupon_id", "==", coupon_id)
+            .where("user_id", "==", user_id)
+            .get()
+        )
+        used_count = 0
+        for doc in redemptions:
+            rd = doc.to_dict() or {}
+            if rd.get("status") in ["reserved", "completed"]:
+                used_count += 1
+        if used_count >= max_uses_per_user:
+            if max_uses_per_user == 1:
+                return Decimal('0'), f"You have already used coupon '{coupon_code}'."
+            return Decimal('0'), f"You have reached the maximum usage limit ({max_uses_per_user}) for coupon '{coupon_code}'."
 
     # 3. Global usage limit restriction
-    max_global_uses = coupon.get("max_global_uses")
-    if max_global_uses is not None and int(max_global_uses) > 0:
-        current_global = coupon.get("current_global_uses", 0)
-        if current_global >= int(max_global_uses):
+    if max_global_uses > 0:
+        current_global = parse_int(coupon.get("current_global_uses"), default=0)
+        if current_global >= max_global_uses:
             return Decimal('0'), f"Coupon '{coupon_code}' has reached its global usage limit."
 
     return Decimal(str(coupon.get("amount") or 0)), None

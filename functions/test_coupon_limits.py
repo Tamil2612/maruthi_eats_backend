@@ -300,6 +300,30 @@ class CouponLimitsTests(unittest.TestCase):
         res2 = main._mark_paid_txn(self.db.transaction(), order_ref, "pay_1")
         self.assertEqual(res2, "already_paid")
 
+    # 11. Concurrency test: Simultaneous requests from same account cannot exceed per-account limit
+    def test_concurrent_checkout_requests_atomic_enforcement(self):
+        import concurrent.futures
+
+        uids = ["u_concurrent_1", "u_concurrent_1"]
+        results = []
+        errors = []
+
+        def place_order_task(uid):
+            try:
+                out, order = self.place([line()], uid=uid, coupon_code="ONCE30")
+                results.append(out["order_id"])
+            except https_fn.HttpsError as e:
+                errors.append(e)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(place_order_task, uid) for uid in uids]
+            concurrent.futures.wait(futures)
+
+        # Exactly 1 order must succeed, and exactly 1 must fail due to limit
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("already used", str(errors[0].message))
+
 
 if __name__ == "__main__":
     unittest.main()
