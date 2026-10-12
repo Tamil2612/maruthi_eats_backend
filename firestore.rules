@@ -56,6 +56,12 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
+    // ── /coupon_redemptions/{redemptionId} ───────────────────
+    match /coupon_redemptions/{redemptionId} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.user_id == request.auth.uid);
+      allow write: if false;
+    }
+
     // ── /offers/{offerId} ────────────────────────────────────
     match /offers/{offerId} {
       allow read: if isSignedIn();

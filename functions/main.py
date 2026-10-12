@@ -98,6 +98,15 @@ PAYMENT_WINDOW_MINUTES = 30
 
 REGION = "asia-south1"  # Mumbai — closest region to an Indian user base
 
+# Latency settings for every function a customer or the restaurant staff WAITS on.
+# A Python function that has been idle needs 3-5 s to start ("cold start"), and
+# paying involves several calls in a row (preview -> place order -> Razorpay order
+# -> verify), so the delays added up to 10+ seconds. One warm instance with a bigger
+# slice of CPU removes that. Cost: roughly Rs. 250/month per warm function.
+# Set HOT_MIN_INSTANCES = 0 to switch the warm instances off again.
+HOT_MIN_INSTANCES = 0
+HOT_MEMORY = options.MemoryOption.MB_512
+
 
 def _notify_admin(order_id: str, order: dict) -> None:
     """Data-only, high-priority push to the admin app (topic `admin_orders`)."""
@@ -236,7 +245,7 @@ def on_order_created(event: firestore_fn.Event) -> None:
 # =======================================================================
 # 2. Secure order placement (optional — replaces the client's direct write)
 # =======================================================================
-@https_fn.on_call(region=REGION, enforce_app_check=True)
+@https_fn.on_call(region=REGION, enforce_app_check=True, memory=HOT_MEMORY, min_instances=HOT_MIN_INSTANCES)
 def place_order(req: https_fn.CallableRequest) -> dict:
     if req.auth is None:
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
@@ -550,7 +559,7 @@ def place_order(req: https_fn.CallableRequest) -> dict:
             )
 
         # 7. Validate Coupon
-        discount_dec, coupon_error = validate_coupon(db, coupon_code, item_total_dec)
+        discount_dec, coupon_error = validate_coupon(db, coupon_code, item_total_dec, user_id=req.auth.uid)
         if coupon_error:
             raise https_fn.HttpsError(https_fn.FunctionsErrorCode.FAILED_PRECONDITION, coupon_error)
 
@@ -585,6 +594,27 @@ def place_order(req: https_fn.CallableRequest) -> dict:
             "created_at": firestore.SERVER_TIMESTAMP,
         })
 
+        # Record coupon redemption / reservation atomically
+        if coupon_code and discount_val > 0:
+            coupon_match = db.collection("coupons").where("code", "==", coupon_code).limit(1).get()
+            if coupon_match:
+                c_id = coupon_match[0].id
+                c_data = coupon_match[0].to_dict() or {}
+                redemption_status = "completed" if payment_mode == "cod" else "reserved"
+                db.collection("coupon_redemptions").document(f"{c_id}_{order_ref.id}").set({
+                    "coupon_id": c_id,
+                    "coupon_code": coupon_code,
+                    "user_id": req.auth.uid,
+                    "order_id": order_ref.id,
+                    "status": redemption_status,
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                })
+                if c_data.get("max_global_uses"):
+                    db.collection("coupons").document(c_id).update({
+                        "current_global_uses": firestore.Increment(1),
+                    })
+
         return {"order_id": order_ref.id, "total": total_val, "delivery_fee": delivery_fee, "distance_km": distance_km}
     except https_fn.HttpsError:
         raise
@@ -598,7 +628,7 @@ def place_order(req: https_fn.CallableRequest) -> dict:
         )
 
 
-@https_fn.on_call(region=REGION)
+@https_fn.on_call(region=REGION, memory=HOT_MEMORY, min_instances=HOT_MIN_INSTANCES)
 def get_checkout_preview(req: https_fn.CallableRequest) -> dict:
     """Calculates server-authoritative delivery distance, delivery fee,
     minimum order status, and restaurant availability for the Flutter checkout screen."""
@@ -631,6 +661,20 @@ def get_checkout_preview(req: https_fn.CallableRequest) -> dict:
 
         min_valid, min_msg = validate_minimum_order(settings, subtotal)
 
+        coupon_code = data.get("coupon_code")
+        coupon_valid = True
+        coupon_error = None
+        coupon_discount = 0.0
+
+        if coupon_code and isinstance(coupon_code, str):
+            coupon_code = coupon_code.strip()[:40] or None
+
+        if coupon_code:
+            user_id = req.auth.uid if req.auth else None
+            discount_dec, coupon_error = validate_coupon(db, coupon_code, subtotal, user_id=user_id)
+            coupon_discount = float(discount_dec)
+            coupon_valid = coupon_error is None
+
         return {
             "is_available": is_avail,
             "status_code": status_code,
@@ -642,6 +686,9 @@ def get_checkout_preview(req: https_fn.CallableRequest) -> dict:
             "minimum_order_value": parse_float(settings.get("minimum_order_value"), default=150.0),
             "meets_minimum_order": min_valid,
             "minimum_order_message": min_msg,
+            "coupon_valid": coupon_valid,
+            "coupon_error": coupon_error,
+            "coupon_discount": coupon_discount,
         }
     except https_fn.HttpsError:
         raise
@@ -780,6 +827,62 @@ def _razorpay_client():
     return razorpay.Client(auth=(key_id, key_secret)), key_id
 
 
+def _complete_coupon_redemption_txn(db, transaction, order_ref, order):
+    coupon_code = order.get("coupon_code")
+    if not coupon_code:
+        return
+    matches = db.collection("coupons").where("code", "==", coupon_code).limit(1).get()
+    if not matches:
+        return
+    c_id = matches[0].id
+    redemption_ref = db.collection("coupon_redemptions").document(f"{c_id}_{order_ref.id}")
+    redemption_snap = redemption_ref.get(transaction=transaction) if transaction else redemption_ref.get()
+    if redemption_snap.exists:
+        rd = redemption_snap.to_dict() or {}
+        if rd.get("status") != "completed":
+            update_data = {
+                "status": "completed",
+                "completed_at": firestore.SERVER_TIMESTAMP,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            }
+            if transaction:
+                transaction.update(redemption_ref, update_data)
+            else:
+                redemption_ref.update(update_data)
+
+
+def _release_coupon_redemption_txn(db, transaction, order_ref, order):
+    coupon_code = order.get("coupon_code")
+    if not coupon_code:
+        return
+    matches = db.collection("coupons").where("code", "==", coupon_code).limit(1).get()
+    if not matches:
+        return
+    c_id = matches[0].id
+    c_data = matches[0].to_dict() or {}
+    redemption_ref = db.collection("coupon_redemptions").document(f"{c_id}_{order_ref.id}")
+    redemption_snap = redemption_ref.get(transaction=transaction) if transaction else redemption_ref.get()
+    if redemption_snap.exists:
+        rd = redemption_snap.to_dict() or {}
+        if rd.get("status") in ["reserved", "completed"]:
+            update_data = {
+                "status": "released",
+                "released_at": firestore.SERVER_TIMESTAMP,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            }
+            if transaction:
+                transaction.update(redemption_ref, update_data)
+            else:
+                redemption_ref.update(update_data)
+
+            if c_data.get("max_global_uses"):
+                coupon_ref = matches[0].reference
+                if transaction:
+                    transaction.update(coupon_ref, {"current_global_uses": firestore.Increment(-1)})
+                else:
+                    coupon_ref.update({"current_global_uses": firestore.Increment(-1)})
+
+
 @firestore.transactional
 def _mark_paid_txn(transaction, order_ref, payment_id):
     """Idempotent: the app call and the webhook can both arrive."""
@@ -789,6 +892,7 @@ def _mark_paid_txn(transaction, order_ref, payment_id):
     if order.get("payment_status") == "paid":
         return "already_paid"
 
+    db = firestore.client()
     if order.get("order_status") == "pending_payment":
         transaction.update(order_ref, {
             "payment_status": "paid",
@@ -797,6 +901,7 @@ def _mark_paid_txn(transaction, order_ref, payment_id):
             "paid_at": firestore.SERVER_TIMESTAMP,
             "updated_at": firestore.SERVER_TIMESTAMP,
         })
+        _complete_coupon_redemption_txn(db, transaction, order_ref, order)
         return "paid"
 
     # Money arrived for an order that already expired/was cancelled: keep the
@@ -857,7 +962,13 @@ def _find_order_by_razorpay_id(db, razorpay_order_id):
     return docs[0].reference if docs else None
 
 
-@https_fn.on_call(region=REGION, enforce_app_check=True, secrets=[RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET])
+@https_fn.on_call(
+    region=REGION,
+    enforce_app_check=True,
+    memory=HOT_MEMORY,
+    min_instances=HOT_MIN_INSTANCES,
+    secrets=[RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET],
+)
 def razorpay_create_order(req: https_fn.CallableRequest) -> dict:
     if req.auth is None:
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
@@ -936,7 +1047,13 @@ def razorpay_create_order(req: https_fn.CallableRequest) -> dict:
         )
 
 
-@https_fn.on_call(region=REGION, enforce_app_check=True, secrets=[RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET])
+@https_fn.on_call(
+    region=REGION,
+    enforce_app_check=True,
+    memory=HOT_MEMORY,
+    min_instances=HOT_MIN_INSTANCES,
+    secrets=[RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET],
+)
 def razorpay_verify_payment(req: https_fn.CallableRequest) -> dict:
     """Called by the app right after Razorpay reports success. The order only
     becomes `placed` if Razorpay's signature checks out - the app can no longer
@@ -1135,8 +1252,66 @@ def _expire_txn(transaction, order_ref):
             "payment_status": "expired",
             "updated_at": firestore.SERVER_TIMESTAMP,
         })
+        db = firestore.client()
+        _release_coupon_redemption_txn(db, transaction, order_ref, order)
         return True
     return False
+
+
+def _paid_payment_for_order(client, razorpay_order_id, expected_paise):
+    """The id of a successfully paid payment (captured, or authorized and then
+    captured by us) for exactly this amount on a Razorpay order, or None."""
+    result = client.order.payments(razorpay_order_id) or {}
+    for payment in result.get("items", []):
+        if int(payment.get("amount") or 0) != int(expected_paise or 0):
+            continue
+        status = payment.get("status")
+        if status == "authorized":
+            payment = _settle_payment(client, payment.get("id"), expected_paise)
+            status = payment.get("status")
+        if status == "captured":
+            return payment.get("id")
+    return None
+
+
+@scheduler_fn.on_schedule(
+    schedule="every 2 minutes",
+    region=REGION,
+    secrets=[RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET],
+)
+def reconcile_pending_payments(event: scheduler_fn.ScheduledEvent) -> None:
+    """Safety net for every way a payment can go unconfirmed: the app was killed while
+    the customer was in their UPI app, the verify call failed, or the webhook is not
+    set up / delayed. Customers who really paid get their order within ~2 minutes."""
+    db = firestore.client()
+    now = datetime.now(timezone.utc)
+
+    candidates = []
+    for doc in db.collection("orders").where("order_status", "==", "pending_payment").get():
+        data = doc.to_dict() or {}
+        started = data.get("payment_started_at") or data.get("created_at")
+        if (
+            data.get("payment_mode") == "upi"
+            and data.get("razorpay_order_id")
+            and started is not None
+            and now - started > timedelta(seconds=45)   # let the app's own verify go first
+        ):
+            candidates.append((doc.reference, data))
+    if not candidates:
+        return
+
+    try:
+        client, _ = _razorpay_client()
+    except https_fn.HttpsError:
+        return  # keys not configured: nothing we can do
+    for order_ref, data in candidates:
+        try:
+            payment_id = _paid_payment_for_order(client, data["razorpay_order_id"], data.get("razorpay_amount"))
+            if payment_id:
+                result = _mark_paid_txn(db.transaction(), order_ref, payment_id)
+                print(f"[PAYMENT RECONCILE] {order_ref.id}: paid via {payment_id} -> {result}")
+        except Exception as e:  # noqa: BLE001 - one bad order must not stop the others
+            print(f"[PAYMENT RECONCILE] {order_ref.id}: {type(e).__name__} - {e}")
 
 
 @scheduler_fn.on_schedule(schedule="every 15 minutes", region=REGION)
@@ -1606,6 +1781,8 @@ def _change_status_txn(transaction, order_ref, new_status, uid, is_staff, reason
     if new_status == "cancelled":
         update["cancel_reason"] = reason
         log["reason"] = reason
+        db = firestore.client()
+        _release_coupon_redemption_txn(db, transaction, order_ref, order)
     else:
         update["status_changed_by"] = uid
 
@@ -1626,7 +1803,7 @@ def _internal_error(name: str, e: Exception):
 
 # min_instances=1: the admin taps these while a customer is waiting, and a cold
 # Python instance (loads Firebase Admin + Razorpay SDK) added 3-5 seconds.
-@https_fn.on_call(region=REGION, min_instances=1)
+@https_fn.on_call(region=REGION, memory=HOT_MEMORY, min_instances=HOT_MIN_INSTANCES)
 def update_order_status(req: https_fn.CallableRequest) -> dict:
     if req.auth is None:
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")
@@ -1701,7 +1878,7 @@ def mark_cod_collected(req: https_fn.CallableRequest) -> dict:
         raise _internal_error("mark_cod_collected", e)
 
 
-@https_fn.on_call(region=REGION, min_instances=1)
+@https_fn.on_call(region=REGION, memory=HOT_MEMORY, min_instances=HOT_MIN_INSTANCES)
 def cancel_order(req: https_fn.CallableRequest) -> dict:
     if req.auth is None:
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Login required")

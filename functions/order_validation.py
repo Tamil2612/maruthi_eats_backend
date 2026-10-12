@@ -176,11 +176,16 @@ def price_items(db: FirestoreClient, items: list[dict]) -> tuple[Decimal, list[s
     return recomputed_total.quantize(Decimal('0.01')), problems
 
 
-def validate_coupon(db: FirestoreClient, coupon_code: str | None, item_total: float | Decimal) -> tuple[Decimal, str | None]:
+def validate_coupon(
+    db: FirestoreClient,
+    coupon_code: str | None,
+    item_total: float | Decimal,
+    user_id: str | None = None,
+) -> tuple[Decimal, str | None]:
     """
-    Re-checks a coupon the same way the Flutter admin/customer apps do:
-    must exist, be active, not expired, and item_total must meet its
-    minimum order value.
+    Re-checks a coupon:
+    must exist, be active, not expired, meet minimum order value,
+    and fulfill first-order-only, per-user, and global usage limits.
     """
     if not coupon_code:
         return Decimal('0'), None
@@ -189,7 +194,9 @@ def validate_coupon(db: FirestoreClient, coupon_code: str | None, item_total: fl
     if not matches:
         return Decimal('0'), f"Coupon '{coupon_code}' does not exist"
 
-    coupon = matches[0].to_dict() or {}
+    coupon_doc = matches[0]
+    coupon = coupon_doc.to_dict() or {}
+    coupon_id = coupon_doc.id
 
     if not coupon.get("is_active", True):
         return Decimal('0'), f"Coupon '{coupon_code}' is not active"
@@ -201,5 +208,48 @@ def validate_coupon(db: FirestoreClient, coupon_code: str | None, item_total: fl
     item_total_decimal = Decimal(str(item_total))
     if item_total_decimal < min_order:
         return Decimal('0'), f"Coupon '{coupon_code}' requires a minimum order of ₹{min_order}, cart total is ₹{item_total_decimal}"
+
+    # 1. First order only restriction
+    if bool(coupon.get("is_first_order_only")):
+        if user_id:
+            orders = (
+                db.collection("orders")
+                .where("customer_id", "==", user_id)
+                .get()
+            )
+            qualifying_count = 0
+            for doc in orders:
+                od = doc.to_dict() or {}
+                if od.get("order_status") in ["placed", "confirmed", "preparing", "out_for_delivery", "delivered"]:
+                    qualifying_count += 1
+            if qualifying_count > 0:
+                return Decimal('0'), f"Coupon '{coupon_code}' is valid for your first order only."
+
+    # 2. Per-user usage limit restriction
+    max_uses_per_user = coupon.get("max_uses_per_user")
+    if max_uses_per_user is not None and int(max_uses_per_user) > 0:
+        if user_id:
+            redemptions = (
+                db.collection("coupon_redemptions")
+                .where("coupon_id", "==", coupon_id)
+                .where("user_id", "==", user_id)
+                .get()
+            )
+            used_count = 0
+            for doc in redemptions:
+                rd = doc.to_dict() or {}
+                if rd.get("status") in ["reserved", "completed"]:
+                    used_count += 1
+            if used_count >= int(max_uses_per_user):
+                if int(max_uses_per_user) == 1:
+                    return Decimal('0'), f"You have already used coupon '{coupon_code}'."
+                return Decimal('0'), f"You have reached the maximum usage limit ({max_uses_per_user}) for coupon '{coupon_code}'."
+
+    # 3. Global usage limit restriction
+    max_global_uses = coupon.get("max_global_uses")
+    if max_global_uses is not None and int(max_global_uses) > 0:
+        current_global = coupon.get("current_global_uses", 0)
+        if current_global >= int(max_global_uses):
+            return Decimal('0'), f"Coupon '{coupon_code}' has reached its global usage limit."
 
     return Decimal(str(coupon.get("amount") or 0)), None
