@@ -314,7 +314,13 @@ def _create_order_and_reserve_coupon_txn(
     # ALL WRITES START HERE (no reads after this point!)
     transaction.set(order_ref, order_data)
 
-    if first_order_ref:
+    # The marker records the customer's FIRST order only. It used to be rewritten by
+    # every later order too, which moved it to whatever order came last.
+    already_marked = bool(
+        first_order_snap and first_order_snap.exists
+        and (first_order_snap.to_dict() or {}).get("has_first_order")
+    )
+    if first_order_ref and not already_marked:
         transaction.set(first_order_ref, {
             "has_first_order": True,
             "order_id": order_ref.id,
@@ -967,6 +973,29 @@ def _complete_coupon_redemption_txn(db, transaction, order_ref, order):
 
 
 def _release_coupon_redemption_txn(db, transaction, order_ref, order):
+    """Called when an order is cancelled or an unpaid one expires: gives back the
+    coupon use AND the customer's "first order" (see _release_coupon_redemption_core)."""
+    user_id = order.get("customer_id")
+    marker_ref = marker_snap = None
+    if user_id:
+        marker_ref = db.collection("user_first_orders").document(user_id)
+        marker_snap = marker_ref.get(transaction=transaction) if transaction else marker_ref.get()
+
+    _release_coupon_redemption_core(db, transaction, order_ref, order)
+
+    # An order that never went through (cancelled, or unpaid and expired) must not use
+    # up the customer's first-order offer. Only the order that created the marker
+    # can clear it; the other checks in validate_coupon still block customers who
+    # really have an earlier order.
+    if marker_snap is not None and marker_snap.exists:
+        if (marker_snap.to_dict() or {}).get("order_id") == order_ref.id:
+            if transaction:
+                transaction.delete(marker_ref)
+            else:
+                marker_ref.delete()
+
+
+def _release_coupon_redemption_core(db, transaction, order_ref, order):
     coupon_code = order.get("coupon_code")
     user_id = order.get("customer_id")
     if not coupon_code:
